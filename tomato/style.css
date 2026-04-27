@@ -1,0 +1,11 @@
+.tomato {
+    width: 100px;
+    height: 100px;
+    background-color: red;
+    border-radius: 50%;
+    cursor: pointer;
+}
+
+.tomato:active {
+    transform: scale(0.9);
+}

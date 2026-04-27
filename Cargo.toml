@@ -1,0 +1,43 @@
+[package]
+name = "opencage"
+version = "0.1.0"
+edition = "2024"
+
+# `local_voice`: microphone (cpal) + offline whisper-rs.
+# `native_clipboard`: image paste via arboard (pulls objc2 on macOS).
+# Linux→macOS `cargo zigbuild` without an Apple SDK: use
+# `--no-default-features` (disables both; see README / zigbuild notes).
+[features]
+default = ["local_voice", "native_clipboard"]
+local_voice = ["dep:cpal", "dep:whisper-rs"]
+native_clipboard = ["dep:arboard"]
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+arboard = { version = "3", optional = true, features = ["image-data"] }
+base64 = "0.22"
+cpal = { version = "0.15", optional = true }
+crossterm = { version = "0.28", features = ["event-stream"] }
+dirs = "6"
+heed = "0.21"
+hound = "3.5"
+image = "0.25"
+rand = "0.8"
+ratatui = "0.29"
+# default-tls + system-proxy pull Apple frameworks (Security, SystemConfiguration),
+# which Zig cannot link on Linux without SDKROOT — disable reqwest defaults.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "charset",
+    "http2",
+    "json",
+    "multipart",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+textwrap = "0.16"
+walkdir = "2"
+whisper-rs = { version = "0.11", optional = true }
