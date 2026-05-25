@@ -51,6 +51,11 @@ impl Provider {
                 "claude-3-5-haiku-latest",
                 "claude-3-5-sonnet-latest",
                 "claude-3-7-sonnet-latest",
+                "claude-sonnet-4-7",
+                "claude-opus-4-7",
+                "claude-haiku-4-7",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
             ],
             Provider::MoonshotAi => &["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
             Provider::GlmBigModel => &["glm-4-flash", "glm-4", "glm-4-air", "glm-4-plus"],
@@ -72,6 +77,19 @@ pub struct Settings {
     #[serde(default)]
     pub glm_api_key: Option<String>,
     pub github_copilot_token: Option<String>,
+    /// OAuth access token migrated from Claude Code (`/migration`). Stored separately from
+    /// `anthropic_api_key`; the existing API-key request path is left untouched.
+    #[serde(default)]
+    pub anthropic_oauth_token: Option<String>,
+    /// Unix-seconds expiry for `anthropic_oauth_token`, if known.
+    #[serde(default)]
+    pub anthropic_oauth_expires_at: Option<u64>,
+    /// Plugin ids tracked by OpenCage, mirrored to/from Claude Code (`/plugins`, `/plugout`).
+    #[serde(default)]
+    pub plugins: Vec<String>,
+    /// Telegram bot token for the `/bots` bridge. Stored encrypted; never hard-coded.
+    #[serde(default)]
+    pub telegram_bot_token: Option<String>,
     pub blocked_commands: HashSet<String>,
     #[serde(default)]
     pub trusted_paths: HashSet<String>,
@@ -94,6 +112,10 @@ impl Default for Settings {
             moonshot_api_key: None,
             glm_api_key: None,
             github_copilot_token: None,
+            anthropic_oauth_token: None,
+            anthropic_oauth_expires_at: None,
+            plugins: Vec::new(),
+            telegram_bot_token: None,
             blocked_commands: ["rm", "shutdown", "reboot", "mkfs", "dd"]
                 .into_iter()
                 .map(str::to_string)

@@ -330,20 +330,47 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let mut items: Vec<ListItem> = vec![];
         for (idx, s) in sessions.iter().enumerate() {
             let marker = if idx == selected { "▶" } else { " " };
-            let line = format!("{marker} {}", s.title);
             let style = if idx == selected {
                 Style::default().fg(Color::Black).bg(Color::LightCyan)
             } else {
                 Style::default().fg(Color::White)
             };
-            items.push(ListItem::new(Line::styled(line, style)));
+            let line = Line::from(vec![
+                Span::styled("● ", Style::default().fg(Color::Red)),
+                Span::styled(format!("{marker} {}", s.title), style),
+            ]);
+            items.push(ListItem::new(line));
         }
         if items.is_empty() {
             items.push(ListItem::new("No saved sessions found."));
         }
         let list = List::new(items).block(
             Block::default()
-                .title("🗂 Sessions (↑/↓ + Enter to switch, Esc to close)")
+                .title("🗂 Sessions (↑/↓+Enter switch · click ● to delete · Esc close)")
+                .borders(Borders::ALL),
+        );
+        frame.render_widget(list, area);
+    }
+
+    if let Some((providers, selected)) = app.provider_popup_state() {
+        let area = centered_rect(50, 45, frame.area());
+        frame.render_widget(Clear, area);
+        let mut items: Vec<ListItem> = vec![];
+        for (idx, name) in providers.iter().enumerate() {
+            let marker = if idx == selected { "▶" } else { " " };
+            let style = if idx == selected {
+                Style::default().fg(Color::Black).bg(Color::LightCyan)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            items.push(ListItem::new(Line::styled(format!("{marker} {name}"), style)));
+        }
+        if items.is_empty() {
+            items.push(ListItem::new("No providers configured."));
+        }
+        let list = List::new(items).block(
+            Block::default()
+                .title("🔀 Switch provider (↑/↓+Enter · click to pick · Esc close)")
                 .borders(Borders::ALL),
         );
         frame.render_widget(list, area);
@@ -481,6 +508,10 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         format!("Moonshot AI key: {}", mask_key(&form.moonshot)),
         format!("GLM (BigModel) key: {}", mask_key(&form.glm)),
         format!("Copilot token: {}", mask_key(&form.copilot)),
+        format!(
+            "Migrate history from: {} (←/→ · Enter to run)",
+            crate::core::migration::MigrationSource::all()[form.migration_idx].label()
+        ),
     ];
 
     let items: Vec<ListItem> = rows
@@ -526,7 +557,7 @@ fn mask_key(v: &str) -> String {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

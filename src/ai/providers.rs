@@ -5,6 +5,28 @@ use serde_json::json;
 use crate::ai::sandbox::run_in_sandbox;
 use crate::core::models::{Message, Provider, Settings};
 
+/// How much conversation history (in chars) to send as context — a large budget so OpenCage
+/// uses a huge context like Claude Code, rather than a tiny fixed message count. ~150k tokens,
+/// which fits safely inside every supported model's window (all ≥ 200k tokens).
+pub const CONTEXT_BUDGET_CHARS: usize = 600_000;
+
+/// The most-recent messages whose combined size fits `budget_chars`, in chronological order.
+/// The latest message is always included even if it alone exceeds the budget.
+pub fn recent_within_budget(history: &[Message], budget_chars: usize) -> Vec<&Message> {
+    let mut total = 0usize;
+    let mut picked: Vec<&Message> = Vec::new();
+    for m in history.iter().rev() {
+        let cost = m.role.len() + m.content.len() + 8;
+        if !picked.is_empty() && total + cost > budget_chars {
+            break;
+        }
+        total += cost;
+        picked.push(m);
+    }
+    picked.reverse();
+    picked
+}
+
 pub fn validate_settings_keys(settings: &Settings) -> Vec<String> {
     vec![
         validate_one("OpenAI", settings.openai_api_key.as_deref(), &["sk-"]),
@@ -179,15 +201,13 @@ pub fn query_with_subagent(
         "role": "system",
         "content": format!("{system_prompt}\n{rag_text}")
     })];
-    let history_cutoff = if attached_image_data_url.is_some() { 1 } else { 12 };
-    let visible_history: Vec<&Message> = history
-        .iter()
-        .rev()
-        .take(history_cutoff.max(1))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    // With an image attached, keep the payload lean (just the latest turn); otherwise send as
+    // much recent history as fits the context budget.
+    let visible_history: Vec<&Message> = if attached_image_data_url.is_some() {
+        history.iter().rev().take(1).collect::<Vec<_>>().into_iter().rev().collect()
+    } else {
+        recent_within_budget(history, CONTEXT_BUDGET_CHARS)
+    };
     for m in &visible_history {
         messages.push(json!({"role": m.role, "content": m.content}));
     }
@@ -287,17 +307,19 @@ pub fn query_coding_actions(
     };
     let system_prompt = format!(
         "You are an autonomous coding agent working in a local project directory. \
-Speak naturally and briefly to the user about what you changed. \
-When you want files written, include machine-readable blocks exactly like:
+Output the file blocks FIRST, before any prose. Write each file EXACTLY like:
 <OPENCAGE_FILE path=\"relative/path.ext\">
-...full file content...
+...complete file content...
 </OPENCAGE_FILE>
-When you want terminal commands run, include blocks like:
+For terminal commands use:
 <OPENCAGE_CMD>command here</OPENCAGE_CMD>
+Rules: write COMPLETE file contents (never elide with comments like \"// rest unchanged\"); \
+do NOT wrap the blocks in markdown code fences; output only plain UTF-8 text; \
+keep any summary to one short sentence placed AFTER all blocks. \
 You may include multiple file/cmd blocks. {depth_hint} {detail_hint}"
     );
     let mut messages = vec![json!({"role":"system","content":system_prompt})];
-    for m in history.iter().rev().take(10).rev() {
+    for m in recent_within_budget(history, CONTEXT_BUDGET_CHARS) {
         messages.push(json!({"role": m.role, "content": m.content}));
     }
     messages.push(json!({"role":"user","content":prompt}));
@@ -324,6 +346,14 @@ struct ProviderAssignment {
 
 fn select_provider_for_subagent(settings: &Settings, subagent: SubAgent) -> ProviderAssignment {
     let enabled = enabled_with_credentials(settings);
+    // Honor the user's explicitly chosen provider first when it has usable credentials;
+    // the remaining providers stay available as fallback in call_with_fallback.
+    if enabled.iter().any(|p| *p == settings.provider) {
+        return ProviderAssignment {
+            model: normalized_model_for_provider(settings, &settings.provider),
+            provider: settings.provider.clone(),
+        };
+    }
     let ordered = preferred_order(subagent);
     for preferred in ordered {
         if enabled.iter().any(|p| *p == preferred) {
@@ -344,22 +374,11 @@ fn select_provider_for_subagent(settings: &Settings, subagent: SubAgent) -> Prov
 }
 
 fn enabled_with_credentials(settings: &Settings) -> Vec<Provider> {
-    let mut enabled = if settings.enabled_providers.is_empty() {
-        vec![settings.provider.clone()]
-    } else {
-        settings.enabled_providers.clone()
-    };
-    enabled.retain(|p| provider_has_credentials(settings, p));
-    if enabled.is_empty() && provider_has_credentials(settings, &settings.provider) {
-        enabled.push(settings.provider.clone());
-    }
-    if enabled.is_empty() {
-        enabled = Provider::all()
-            .into_iter()
-            .filter(|p| provider_has_credentials(settings, p))
-            .collect();
-    }
-    enabled
+    // The selected provider is authoritative: only ever use it, so switching providers never
+    // leaves a previously-selected one connected. If it lacks credentials the call surfaces a
+    // clear error rather than silently falling back to a different provider (e.g. the migrated
+    // Anthropic OAuth being used while Groq is selected).
+    vec![settings.provider.clone()]
 }
 
 fn preferred_order(subagent: SubAgent) -> Vec<Provider> {
@@ -407,7 +426,7 @@ fn preferred_order(subagent: SubAgent) -> Vec<Provider> {
     }
 }
 
-fn provider_has_credentials(settings: &Settings, provider: &Provider) -> bool {
+pub fn provider_has_credentials(settings: &Settings, provider: &Provider) -> bool {
     match provider {
         Provider::OpenAi => settings
             .openai_api_key
@@ -423,6 +442,10 @@ fn provider_has_credentials(settings: &Settings, provider: &Provider) -> bool {
             .anthropic_api_key
             .as_ref()
             .is_some_and(|v| !v.trim().is_empty())
+            || settings
+                .anthropic_oauth_token
+                .as_ref()
+                .is_some_and(|v| !v.trim().is_empty())
             || std::env::var("ANTHROPIC_API_KEY").ok().is_some(),
         Provider::MoonshotAi => settings
             .moonshot_api_key
@@ -541,12 +564,7 @@ fn call_anthropic(
     history: &[Message],
     system_prompt: &str,
 ) -> Result<String> {
-    let key = settings
-        .anthropic_api_key
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-        .context("ANTHROPIC_API_KEY missing")?;
-    let anthropic_msgs: Vec<_> = history
+    let anthropic_msgs: Vec<serde_json::Value> = history
         .iter()
         .map(|m| {
             json!({
@@ -555,25 +573,118 @@ fn call_anthropic(
             })
         })
         .collect();
-    let body = json!({
-        "model": model,
-        "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": anthropic_msgs
-    });
-    let v: serde_json::Value = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .context("Anthropic request failed")?
-        .json()
-        .context("Anthropic returned invalid JSON")?;
-    Ok(v["content"][0]["text"]
-        .as_str()
-        .unwrap_or("No content")
-        .to_string())
+
+    // Try the requested model; if Anthropic 404s it (e.g. a 4.7 tier that isn't live yet),
+    // transparently retry with the latest available model of the same tier.
+    let mut models = vec![model.to_string()];
+    if let Some(fb) = anthropic_fallback_model(model) {
+        models.push(fb.to_string());
+    }
+    let mut last = "Anthropic returned no usable response".to_string();
+    for m in &models {
+        let (status, v) = anthropic_send(client, settings, m, system_prompt, &anthropic_msgs)?;
+        if status.is_success() {
+            // Concatenate every text block (a response may contain more than one).
+            let text: String = v["content"]
+                .as_array()
+                .map(|blocks| {
+                    blocks
+                        .iter()
+                        .filter(|b| b["type"].as_str() == Some("text"))
+                        .filter_map(|b| b["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            return Ok(if text.trim().is_empty() {
+                "No content".to_string()
+            } else {
+                text
+            });
+        }
+        let err = v["error"]["message"]
+            .as_str()
+            .unwrap_or("Unknown Anthropic error");
+        last = format!("Anthropic API error ({status}): {err}");
+        if status.as_u16() != 404 {
+            break; // only model-not-found is worth a fallback attempt
+        }
+    }
+    Ok(last)
+}
+
+/// The latest live model to fall back to when a requested model id 404s.
+fn anthropic_fallback_model(model: &str) -> Option<&'static str> {
+    match model {
+        "claude-sonnet-4-7" => Some("claude-sonnet-4-6"),
+        "claude-haiku-4-7" => Some("claude-haiku-4-5-20251001"),
+        _ => None,
+    }
+}
+
+/// Send one Anthropic `/v1/messages` request for `model`; returns the HTTP status and JSON body.
+fn anthropic_send(
+    client: &Client,
+    settings: &Settings,
+    model: &str,
+    system_prompt: &str,
+    msgs: &[serde_json::Value],
+) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+    let oauth = settings
+        .anthropic_oauth_token
+        .as_ref()
+        .filter(|t| !t.trim().is_empty());
+
+    // Coding tasks emit whole files; a small cap truncates them. 4.x allow large outputs.
+    let max_tokens = if model.contains("sonnet-4") || model.contains("opus-4") {
+        32000
+    } else if model.contains("-4-") {
+        16384
+    } else {
+        8192
+    };
+    let messages_val = serde_json::Value::Array(msgs.to_vec());
+
+    // Prefer the migrated Claude Code OAuth token (Bearer + oauth beta + Claude Code system
+    // identity); otherwise use the x-api-key path.
+    let req = client.post("https://api.anthropic.com/v1/messages");
+    let (req, body) = if let Some(token) = oauth {
+        let body = json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": [
+                {"type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude."},
+                {"type": "text", "text": system_prompt}
+            ],
+            "messages": messages_val
+        });
+        let req = req
+            .header("authorization", format!("Bearer {token}"))
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "oauth-2025-04-20");
+        (req, body)
+    } else {
+        let key = settings
+            .anthropic_api_key
+            .clone()
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            .context("Anthropic credentials missing (set an API key or run /migration claude)")?;
+        let body = json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": messages_val
+        });
+        let req = req
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01");
+        (req, body)
+    };
+
+    let resp = req.json(&body).send().context("Anthropic request failed")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().context("Anthropic returned invalid JSON")?;
+    Ok((status, v))
 }
 
 fn call_glm_bigmodel(

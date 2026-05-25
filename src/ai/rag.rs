@@ -16,6 +16,7 @@ struct MemoryEntry {
     ts: u64,
 }
 
+#[derive(Clone)]
 pub struct RagStore {
     env: Env,
     db: Database<Str, Bytes>,

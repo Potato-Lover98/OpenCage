@@ -1,9 +1,28 @@
+# Rust build artifacts
 /target
 dist/
+
+# Lock files: keep Cargo.lock (this is a binary), ignore any others
+*.lock
+!Cargo.lock
+
+# Logs & temp files
 *.log
 *.tmp
+
+# Secrets / encryption keys (OpenCage's settings.key etc. — never commit)
+*.key
+
+# OS & editor cruft
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
-*.lock
+
+# Personal Claude Code config (gitignored, not shared)
+CLAUDE.local.md
+
+# OpenCage generated output (beetle designs, autonomous-coding test apps)
+/beetle/
+/what-opencage-coded-test/
+/tomato/

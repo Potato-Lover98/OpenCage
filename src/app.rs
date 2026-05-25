@@ -19,7 +19,7 @@ use ratatui::layout::{Position, Rect};
 use crossterm::execute;
 use crossterm::terminal::{
     size,
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use serde::Deserialize;
@@ -27,15 +27,19 @@ use walkdir::WalkDir;
 
 use crate::ai::image_paste::{encode_as_data_url, grab_clipboard_image};
 use crate::ai::providers::{
-    query_coding_actions, query_with_subagent, select_subagents, validate_settings_keys,
+    provider_has_credentials, query_coding_actions, query_with_subagent, select_subagents,
+    validate_settings_keys,
 };
 use crate::ai::sandbox::run_in_sandbox;
 use crate::ai::rag::RagStore;
+use crate::ai::telegram;
 use crate::ai::voice::{
     render_level_bar, spawn_live_stt, CloudSttConfig, VoiceRecorder, VoiceSttUpdate,
 };
 use crate::core::config::SettingsStore;
+use crate::core::migration::{self, MigrationSource};
 use crate::core::models::{FileNode, Message, Provider, Settings};
+use crate::core::plugins;
 use crate::ui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +78,8 @@ pub struct SettingsForm {
     pub moonshot: String,
     pub glm: String,
     pub copilot: String,
+    /// Selected source (index into `MigrationSource::all()`) for the migration row.
+    pub migration_idx: usize,
     pub report: Vec<String>,
 }
 
@@ -128,6 +134,19 @@ pub struct App {
     sessions_menu: Vec<SessionMeta>,
     sessions_selected: usize,
     alerts: VecDeque<AlertItem>,
+    /// Last terminal tab title we wrote, so we only re-emit the OSC sequence on change.
+    tab_title: String,
+    /// Set the flag to stop the Telegram polling thread; `Some` means a bot is running.
+    telegram_stop: Option<Arc<AtomicBool>>,
+    /// Activity lines from the Telegram thread, drained into the chat as system messages.
+    telegram_rx: Option<Receiver<String>>,
+    /// Set the flag to stop the Beetle Design web server; `Some` means it's running.
+    beetle_stop: Option<Arc<AtomicBool>>,
+    /// URL the Beetle Design server is listening on, for reopening the browser.
+    beetle_url: Option<String>,
+    show_provider_popup: bool,
+    provider_menu: Vec<Provider>,
+    provider_selected: usize,
 }
 
 pub struct AgentResult {
@@ -184,6 +203,12 @@ impl App {
                 "/deep",
                 "/expand",
                 "/voice",
+                "/migration",
+                "/anthropic",
+                "/plugins",
+                "/plugout",
+                "/bots",
+                "/beetle",
             ],
             palette_selected: 0,
             chat_scroll: 0,
@@ -201,7 +226,7 @@ impl App {
             last_tree_refresh: Instant::now(),
             file_tree_root_expanded: true,
             expanded_paths: HashSet::new(),
-            context_window_limit_chars: 120_000,
+            context_window_limit_chars: crate::ai::providers::CONTEXT_BUDGET_CHARS,
             pending_command: None,
             command_approval_yes: true,
             queued_commands: VecDeque::new(),
@@ -224,6 +249,14 @@ impl App {
             sessions_menu: vec![],
             sessions_selected: 0,
             alerts: VecDeque::new(),
+            tab_title: String::new(),
+            telegram_stop: None,
+            telegram_rx: None,
+            beetle_stop: None,
+            beetle_url: None,
+            show_provider_popup: false,
+            provider_menu: Vec::new(),
+            provider_selected: 0,
         };
         if let Err(e) = app.load_session_messages() {
             app.messages.push(Message {
@@ -263,11 +296,24 @@ impl App {
         let tick = Duration::from_millis(120);
         let mut should_quit = false;
 
+        // Resume the Telegram bridge automatically if a token was saved.
+        if self
+            .settings
+            .telegram_bot_token
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty())
+        {
+            self.start_telegram_bot();
+        }
+
         while !should_quit {
             self.sync_cwd_and_tree();
             self.sync_blacklist_file();
             self.sync_voice_state();
             self.persist_session_if_needed();
+            self.sync_terminal_title();
+            self.drain_telegram_log();
+            self.sync_beetle_state();
             terminal.draw(|f| ui::draw(f, self))?;
 
             if let Some(rx) = self.pending_response.as_ref() {
@@ -316,8 +362,15 @@ impl App {
             }
         }
 
+        if let Some(stop) = self.telegram_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(stop) = self.beetle_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
         disable_raw_mode()?;
         let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        let _ = execute!(terminal.backend_mut(), SetTitle(""));
         execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
         terminal.show_cursor()?;
         if self.show_resume_hint_on_exit {
@@ -419,6 +472,31 @@ impl App {
                         && !key.modifiers.contains(KeyModifiers::ALT) =>
                 {
                     self.switch_to_selected_session();
+                    return false;
+                }
+                _ => return false,
+            }
+        }
+        if self.show_provider_popup {
+            match key.code {
+                KeyCode::Esc => {
+                    self.show_provider_popup = false;
+                    self.last_status = "Closed provider switch".to_string();
+                    return false;
+                }
+                KeyCode::Up => {
+                    self.provider_selected = self.provider_selected.saturating_sub(1);
+                    return false;
+                }
+                KeyCode::Down => {
+                    if !self.provider_menu.is_empty() {
+                        self.provider_selected =
+                            (self.provider_selected + 1).min(self.provider_menu.len() - 1);
+                    }
+                    return false;
+                }
+                KeyCode::Enter => {
+                    self.apply_provider_switch();
                     return false;
                 }
                 _ => return false,
@@ -692,7 +770,7 @@ impl App {
                 code: KeyCode::Down,
                 ..
             } => {
-                form.selected = (form.selected + 1).min(9);
+                form.selected = (form.selected + 1).min(10);
             }
             KeyEvent {
                 code: KeyCode::Left,
@@ -735,10 +813,31 @@ impl App {
                 form.model_idx = (form.model_idx + 1) % total;
             }
             KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } if form.selected == 10 => {
+                let total = MigrationSource::all().len();
+                form.migration_idx = (form.migration_idx + total - 1) % total;
+            }
+            KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } if form.selected == 10 => {
+                let total = MigrationSource::all().len();
+                form.migration_idx = (form.migration_idx + 1) % total;
+            }
+            KeyEvent {
                 code: KeyCode::Enter,
                 ..
             } if form.selected == 3 => {
                 form.cuss_filter = !form.cuss_filter;
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                ..
+            } if form.selected == 10 => {
+                let source = MigrationSource::all()[form.migration_idx];
+                self.run_migration_source(source);
             }
             KeyEvent {
                 code: KeyCode::Char('s'),
@@ -791,6 +890,14 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {}
             _ => return,
+        }
+        if self.show_sessions_popup {
+            self.try_sessions_delete_click(mouse);
+            return;
+        }
+        if self.show_provider_popup {
+            self.try_provider_click(mouse);
+            return;
         }
         if self.active_tab == ActiveTab::Alerts && self.try_alerts_command_click(mouse) {
             return;
@@ -1033,7 +1140,7 @@ impl App {
             }
             "/help" => {
                 self.push_system_message(
-                    "Commands: /alerts /settings /avatar /model /buddy /btw /new /sessions /blacklist /clear /refresh /remember /memories /deep(on|off|0-10) /expand(on|off)",
+                    "Commands: /alerts /settings /avatar /model[ switch] /buddy /btw /new /sessions /blacklist /clear /refresh /remember /memories /deep(on|off|0-10) /expand(on|off) /migration(claude|openclaw|hermes) /anthropic models <opus-4.7|sonnet-4.7|haiku-4.7> /plugins [available] /plugout <name> /bots <token> /beetle",
                 );
             }
             "/buddy" => {
@@ -1058,16 +1165,18 @@ impl App {
                     self.handle_enter();
                 }
             }
-            "/model" => {
-                self.messages.push(Message {
+            "/model" => match parts.next().unwrap_or_default() {
+                "switch" => self.open_provider_switch(),
+                "" => self.messages.push(Message {
                     role: "system".to_string(),
                     content: format!(
                         "Current provider={} model={}",
                         self.settings.provider.as_str(),
                         self.settings.model
                     ),
-                });
-            }
+                }),
+                _ => self.push_system_message("Usage: /model [switch]"),
+            },
             "/avatar" => {
                 let avatar = parts.collect::<Vec<_>>().join(" ");
                 if avatar.is_empty() {
@@ -1260,6 +1369,133 @@ impl App {
             "/voice" => {
                 self.toggle_voice_recording();
             }
+            "/migration" => {
+                let arg = parts.next().unwrap_or_default();
+                match MigrationSource::from_arg(arg) {
+                    Some(source) => self.run_migration_source(source),
+                    None => self.push_system_message(
+                        "Usage: /migration <claude|openclaw|hermes> (also in Settings tab)",
+                    ),
+                }
+            }
+            "/anthropic" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    ["models", model] => match anthropic_model_id(model) {
+                        Some(id) => {
+                            self.settings.provider = Provider::Anthropic;
+                            self.settings.model = id.to_string();
+                            self.settings.enabled_providers = vec![Provider::Anthropic];
+                            if let Err(e) = SettingsStore::save(&self.settings) {
+                                self.last_status = format!("Settings save failed: {e}");
+                            }
+                            self.push_system_message(&format!(
+                                "Anthropic model set to {id} (provider switched to Anthropic)."
+                            ));
+                        }
+                        None => self.push_system_message(
+                            "Unknown model. Options: opus-4.7, sonnet-4.7, haiku-4.7",
+                        ),
+                    },
+                    ["models"] | [] => self.push_system_message(&format!(
+                        "Anthropic models: opus-4.7, sonnet-4.7, haiku-4.7. Current: {}. Usage: /anthropic models <model>",
+                        self.settings.model
+                    )),
+                    _ => self.push_system_message(
+                        "Usage: /anthropic models <opus-4.7|sonnet-4.7|haiku-4.7>",
+                    ),
+                }
+            }
+            "/plugins" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [] | ["list"] => {
+                        if self.settings.plugins.is_empty() {
+                            self.push_system_message(
+                                "No plugins tracked. Install with /plugins <name>, browse with /plugins available [query].",
+                            );
+                        } else {
+                            self.push_system_message(&format!(
+                                "Installed plugins ({}):\n- {}",
+                                self.settings.plugins.len(),
+                                self.settings.plugins.join("\n- ")
+                            ));
+                        }
+                    }
+                    ["available"] => {
+                        let count = plugins::available().len();
+                        self.push_system_message(&format!(
+                            "{count} plugins available in your Claude Code marketplace. Filter with /plugins available <query>; install with /plugins <name>.",
+                        ));
+                    }
+                    ["available", query] => {
+                        let q = query.to_lowercase();
+                        let hits: Vec<String> = plugins::available()
+                            .into_iter()
+                            .filter(|p| p.to_lowercase().contains(q.as_str()))
+                            .take(40)
+                            .collect();
+                        self.push_system_message(&if hits.is_empty() {
+                            format!("No catalog plugins match '{query}'.")
+                        } else {
+                            format!("Matches for '{query}':\n- {}", hits.join("\n- "))
+                        });
+                    }
+                    ["idk"] => self.open_claude_marketplace(),
+                    [name] => self.install_plugin(name),
+                    _ => self.push_system_message(
+                        "Usage: /plugins [list] | available [query] | <name>",
+                    ),
+                }
+            }
+            "/plugout" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [name] => self.remove_plugin(name),
+                    _ => self.push_system_message("Usage: /plugout <name>"),
+                }
+            }
+            "/beetle" => self.start_beetle(),
+            "/bots" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    [] | ["status"] => {
+                        let running = self.telegram_stop.is_some();
+                        let has_token = self
+                            .settings
+                            .telegram_bot_token
+                            .as_ref()
+                            .is_some_and(|t| !t.trim().is_empty());
+                        self.push_system_message(&format!(
+                            "Telegram bot: {}. Token {}. Paste your token with /bots <token>; also: /bots stop | clear",
+                            if running { "running" } else { "stopped" },
+                            if has_token { "saved" } else { "not set" },
+                        ));
+                    }
+                    ["start"] | ["on"] => self.start_telegram_bot(),
+                    ["stop"] | ["off"] => self.stop_telegram_bot(),
+                    ["clear"] | ["remove"] => {
+                        self.stop_telegram_bot();
+                        self.settings.telegram_bot_token = None;
+                        let _ = SettingsStore::save(&self.settings);
+                        self.push_system_message("Telegram token cleared.");
+                    }
+                    [token] => {
+                        if self.telegram_stop.is_some() {
+                            self.stop_telegram_bot();
+                        }
+                        self.settings.telegram_bot_token = Some((*token).to_string());
+                        if let Err(e) = SettingsStore::save(&self.settings) {
+                            self.push_alert(AlertKind::Error, "Settings save failed", &e.to_string());
+                        }
+                        self.push_system_message("Telegram token saved (encrypted). Starting bot…");
+                        self.start_telegram_bot();
+                    }
+                    _ => self.push_system_message(
+                        "Usage: /bots <token> | start | stop | clear | status",
+                    ),
+                }
+            }
             _ => {
                 self.push_alert(
                     AlertKind::Error,
@@ -1421,6 +1657,80 @@ impl App {
         }
     }
 
+    /// Set the terminal tab/window title to "⬡ <current task>", à la Claude Code. Only emits
+    /// the OSC escape when the title actually changes, to avoid per-tick churn.
+    fn sync_terminal_title(&mut self) {
+        let title = self.compute_tab_title();
+        if title != self.tab_title {
+            let _ = execute!(std::io::stdout(), SetTitle(&title));
+            self.tab_title = title;
+        }
+    }
+
+    fn compute_tab_title(&self) -> String {
+        const LOGO: &str = "⬡"; // OpenCage mark (a "cell/cage"), distinct from Claude Code's ✳.
+        if self.busy {
+            return format!("{LOGO} OpenCage · working…");
+        }
+        let mut summary = summarize_session_title(&self.messages).replace('\n', " ");
+        if summary.chars().count() > 40 {
+            summary = summary.chars().take(39).collect::<String>() + "…";
+        }
+        if summary.is_empty() || summary == "New session" {
+            format!("{LOGO} OpenCage")
+        } else {
+            format!("{LOGO} {summary}")
+        }
+    }
+
+    /// Spawn the Telegram polling thread (no-op if already running or no token saved).
+    fn start_telegram_bot(&mut self) {
+        if self.telegram_stop.is_some() {
+            self.push_system_message("Telegram bot is already running.");
+            return;
+        }
+        let Some(token) = self
+            .settings
+            .telegram_bot_token
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+        else {
+            self.push_system_message("No Telegram token set. Use /bots <token>.");
+            return;
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let settings = self.settings.clone();
+        let cwd = self.current_dir.clone();
+        let stop_bg = stop.clone();
+        std::thread::spawn(move || telegram::run_bot(token, settings, cwd, stop_bg, tx));
+        self.telegram_stop = Some(stop);
+        self.telegram_rx = Some(rx);
+        self.last_status = "Telegram bot starting…".to_string();
+    }
+
+    fn stop_telegram_bot(&mut self) {
+        if let Some(stop) = self.telegram_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+            self.push_system_message("Telegram bot stopping…");
+        } else {
+            self.push_system_message("Telegram bot is not running.");
+        }
+    }
+
+    /// Surface Telegram activity lines in the chat (incoming messages, replies, status).
+    fn drain_telegram_log(&mut self) {
+        let mut lines = Vec::new();
+        if let Some(rx) = self.telegram_rx.as_ref() {
+            while let Ok(line) = rx.try_recv() {
+                lines.push(line);
+            }
+        }
+        for line in lines {
+            self.push_system_message(&line);
+        }
+    }
+
     fn load_session_messages(&mut self) -> Result<()> {
         self.messages = load_session_messages(&self.session_id)?;
         self.last_persisted_messages_len = self.messages.len();
@@ -1448,6 +1758,81 @@ impl App {
         }
         self.show_sessions_popup = false;
         self.last_status = format!("Switched to session {}", meta.id);
+    }
+
+    /// Permanently delete the session at `idx` in the open sessions popup.
+    fn delete_session_at(&mut self, idx: usize) {
+        let Some(meta) = self.sessions_menu.get(idx).cloned() else {
+            return;
+        };
+        match delete_session_file(&meta.id) {
+            Ok(()) => {
+                self.sessions_menu.remove(idx);
+                if self.sessions_selected >= self.sessions_menu.len() {
+                    self.sessions_selected = self.sessions_menu.len().saturating_sub(1);
+                }
+                self.push_alert(
+                    AlertKind::Success,
+                    "Session deleted",
+                    &format!("Permanently deleted: {}", meta.title),
+                );
+                self.last_status = format!("Deleted session {}", meta.id);
+            }
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Delete failed", &e.to_string());
+                self.last_status = format!("Delete failed: {e}");
+            }
+        }
+    }
+
+    /// Open the `/model switch` popup listing the providers you've configured.
+    fn open_provider_switch(&mut self) {
+        let configured: Vec<Provider> = Provider::all()
+            .into_iter()
+            .filter(|p| provider_has_credentials(&self.settings, p))
+            .collect();
+        // Fall back to all providers if none have credentials yet, so you can still pick.
+        let menu = if configured.is_empty() {
+            Provider::all().to_vec()
+        } else {
+            configured
+        };
+        self.provider_selected = menu
+            .iter()
+            .position(|p| std::mem::discriminant(p) == std::mem::discriminant(&self.settings.provider))
+            .unwrap_or(0);
+        self.provider_menu = menu;
+        self.show_provider_popup = true;
+        self.last_status = "Pick a provider (↑/↓ + Enter, Esc to close)".to_string();
+    }
+
+    fn apply_provider_switch(&mut self) {
+        let Some(provider) = self.provider_menu.get(self.provider_selected).cloned() else {
+            self.show_provider_popup = false;
+            return;
+        };
+        // Keep a remembered model for this provider if valid; else use its default.
+        let model = self
+            .settings
+            .provider_models
+            .get(provider.as_str())
+            .cloned()
+            .filter(|m| provider.models().iter().any(|x| *x == m.as_str()))
+            .unwrap_or_else(|| provider.models().first().copied().unwrap_or("").to_string());
+        self.settings.provider = provider.clone();
+        self.settings.model = model;
+        // Forget any previously-selected provider — only the chosen one stays active.
+        self.settings.enabled_providers = vec![provider.clone()];
+        if let Err(e) = SettingsStore::save(&self.settings) {
+            self.last_status = format!("Settings save failed: {e}");
+        }
+        self.show_provider_popup = false;
+        self.push_system_message(&format!(
+            "Switched to {} ({}).",
+            provider.as_str(),
+            self.settings.model
+        ));
+        self.last_status = format!("Provider: {}", provider.as_str());
     }
 
     fn open_blacklist_editor(&self) -> Result<PathBuf> {
@@ -1783,6 +2168,7 @@ impl App {
             moonshot: self.settings.moonshot_api_key.clone().unwrap_or_default(),
             glm: self.settings.glm_api_key.clone().unwrap_or_default(),
             copilot: self.settings.github_copilot_token.clone().unwrap_or_default(),
+            migration_idx: 0,
             report: vec!["Press Ctrl+S to save, F5 to validate, Esc to close".to_string()],
         });
         self.active_tab = ActiveTab::Settings;
@@ -1793,6 +2179,8 @@ impl App {
         let mut s = self.settings.clone();
         s.provider = Provider::all()[form.provider_idx].clone();
         s.model = s.provider.models()[form.model_idx].to_string();
+        // Only the selected provider stays active — don't keep prior providers connected.
+        s.enabled_providers = vec![s.provider.clone()];
         s.ai_avatar = form.avatar.clone();
         s.cuss_filter = form.cuss_filter;
         s.openai_api_key = if form.openai.trim().is_empty() {
@@ -1856,6 +2244,206 @@ impl App {
         }
     }
 
+    /// Import history (and, for Claude Code, the OAuth token) from another AI CLI.
+    /// The OAuth token is stored in its own settings field; existing API keys are left alone.
+    fn run_migration_source(&mut self, source: MigrationSource) {
+        self.last_status = format!("Migrating from {}…", source.label());
+        let summary = match migration::migrate(source) {
+            Ok(outcome) => {
+                let mut imported = 0usize;
+                for s in &outcome.sessions {
+                    let id = format!("{}-{}", source.id_prefix(), s.source_id);
+                    if save_imported_session(&id, &s.messages, s.updated_ts).is_ok() {
+                        imported += 1;
+                    }
+                }
+                let oauth_captured = outcome.oauth.is_some();
+                if let Some(creds) = outcome.oauth {
+                    self.settings.anthropic_oauth_token = Some(creds.access_token);
+                    self.settings.anthropic_oauth_expires_at = creds.expires_at;
+                }
+                // Claude Code also exposes its installed plugins — mirror them into OpenCage.
+                let mut synced_plugins = 0usize;
+                if source == MigrationSource::ClaudeCode {
+                    self.settings.plugins = plugins::read_installed();
+                    synced_plugins = self.settings.plugins.len();
+                }
+                if let Err(e) = SettingsStore::save(&self.settings) {
+                    self.push_alert(AlertKind::Error, "Settings save failed", &e.to_string());
+                }
+                let msg = format!(
+                    "Migration from {}: imported {imported} session(s){}{}.",
+                    source.label(),
+                    if oauth_captured {
+                        ", captured OAuth token (API-key settings unchanged)"
+                    } else {
+                        ""
+                    },
+                    if synced_plugins > 0 {
+                        format!(", synced {synced_plugins} plugin(s)")
+                    } else {
+                        String::new()
+                    }
+                );
+                self.push_alert(AlertKind::Success, "Migration complete", &msg);
+                msg
+            }
+            Err(e) => {
+                let msg = format!("Migration from {} failed: {e}", source.label());
+                self.push_alert(AlertKind::Error, "Migration failed", &msg);
+                msg
+            }
+        };
+        self.push_system_message(&summary);
+        self.last_status = summary.clone();
+        if let Some(form) = self.settings_form.as_mut() {
+            form.report = vec![summary];
+        }
+    }
+
+    /// Install + enable a marketplace plugin, syncing it into Claude Code and tracking it here.
+    fn install_plugin(&mut self, name: &str) {
+        match plugins::install(name) {
+            Ok(id) => {
+                if !self.settings.plugins.contains(&id) {
+                    self.settings.plugins.push(id.clone());
+                    self.settings.plugins.sort();
+                }
+                if let Err(e) = SettingsStore::save(&self.settings) {
+                    self.push_alert(AlertKind::Error, "Settings save failed", &e.to_string());
+                }
+                self.push_alert(
+                    AlertKind::Success,
+                    "Plugin installed",
+                    &format!("{id} (synced to Claude Code)"),
+                );
+                self.push_system_message(&format!(
+                    "Installed plugin {id} and enabled it in Claude Code."
+                ));
+            }
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Plugin install failed", &e.to_string());
+                self.push_system_message(&format!("Could not install plugin: {e}"));
+            }
+        }
+    }
+
+    /// Remove + disable a plugin, in both OpenCage and Claude Code.
+    fn remove_plugin(&mut self, name: &str) {
+        match plugins::uninstall(name) {
+            Ok(id) => {
+                self.settings.plugins.retain(|p| p != &id);
+                if let Err(e) = SettingsStore::save(&self.settings) {
+                    self.push_alert(AlertKind::Error, "Settings save failed", &e.to_string());
+                }
+                self.push_alert(
+                    AlertKind::Success,
+                    "Plugin removed",
+                    &format!("{id} (synced to Claude Code)"),
+                );
+                self.push_system_message(&format!(
+                    "Removed plugin {id} from OpenCage and Claude Code."
+                ));
+            }
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Plugin remove failed", &e.to_string());
+                self.push_system_message(&format!("Could not remove plugin: {e}"));
+            }
+        }
+    }
+
+    /// `/plugins idk`: open a fresh terminal window running Claude Code's interactive
+    /// plugin marketplace (`claude /plugin`). The window can simply be closed when done.
+    fn open_claude_marketplace(&mut self) {
+        let inner = "claude /plugin";
+        // Tried in order; first emulator that spawns wins. `bash -lc` gives a login PATH
+        // so `claude` (in ~/.local/bin) resolves regardless of how OpenCage was launched.
+        let attempts: [(&str, &[&str]); 6] = [
+            ("gnome-terminal", &["--", "bash", "-lc", inner]),
+            ("konsole", &["-e", "bash", "-lc", inner]),
+            ("x-terminal-emulator", &["-e", "bash", "-lc", inner]),
+            ("alacritty", &["-e", "bash", "-lc", inner]),
+            ("kitty", &["bash", "-lc", inner]),
+            ("xterm", &["-e", "bash", "-lc", inner]),
+        ];
+        for (term, args) in attempts {
+            if Command::new(term).args(args).spawn().is_ok() {
+                self.push_alert(
+                    AlertKind::Success,
+                    "Opening marketplace",
+                    &format!("Launched {term} running `{inner}`."),
+                );
+                self.push_system_message(&format!(
+                    "Opened a new {term} window running `{inner}` (Claude Code plugin marketplace). Close it when done."
+                ));
+                self.last_status = "Opened Claude plugin marketplace".to_string();
+                return;
+            }
+        }
+        self.push_alert(
+            AlertKind::Error,
+            "No terminal found",
+            "Could not launch a terminal (tried gnome-terminal, konsole, x-terminal-emulator, alacritty, kitty, xterm).",
+        );
+        self.push_system_message("Could not open a terminal window for the marketplace.");
+    }
+
+    /// `/beetle`: start the Beetle Design web server and open it in the browser.
+    fn start_beetle(&mut self) {
+        if let Some(stop) = self.beetle_stop.clone() {
+            if !stop.load(Ordering::Relaxed) {
+                if let Some(url) = self.beetle_url.clone() {
+                    open_in_browser(&url);
+                    self.push_system_message(&format!("Beetle Design is already running: {url}"));
+                }
+                return;
+            }
+            // The previous server stopped itself (tab closed) — clear and start fresh.
+            self.beetle_stop = None;
+            self.beetle_url = None;
+        }
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+            Ok(l) => l,
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Beetle failed to start", &e.to_string());
+                return;
+            }
+        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let url = format!("http://127.0.0.1:{port}/");
+        let cwd = self.current_dir.clone();
+        let rag = self.rag.clone();
+        let session_id = self.session_id.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = stop.clone();
+        std::thread::spawn(move || {
+            crate::ai::beetle::serve(listener, cwd, rag, session_id, stop_bg)
+        });
+        self.beetle_stop = Some(stop);
+        self.beetle_url = Some(url.clone());
+        open_in_browser(&url);
+        self.push_alert(AlertKind::Success, "Beetle Design", &format!("Live design UI at {url}"));
+        self.push_system_message(&format!(
+            "Beetle Design is live at {url} (opened in your browser). Describe your app, preview it, then push or download. Closing the tab stops the server."
+        ));
+        self.last_status = "Beetle Design running".to_string();
+    }
+
+    /// Notice when the Beetle server has stopped itself (tab closed / heartbeat lost) so `/beetle`
+    /// can start a fresh one.
+    fn sync_beetle_state(&mut self) {
+        let stopped = self
+            .beetle_stop
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::Relaxed));
+        if stopped {
+            self.beetle_stop = None;
+            self.beetle_url = None;
+            self.push_system_message("Beetle Design server stopped (tab closed).");
+            self.last_status = "Beetle Design stopped".to_string();
+        }
+    }
+
     fn filter_cuss(&self, text: String) -> String {
         if !self.settings.cuss_filter {
             return text;
@@ -1906,6 +2494,23 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// Display rows + selected index for the `/model switch` popup (None when closed).
+    pub fn provider_popup_state(&self) -> Option<(Vec<String>, usize)> {
+        if !self.show_provider_popup {
+            return None;
+        }
+        let rows = self
+            .provider_menu
+            .iter()
+            .map(|p| {
+                let current = std::mem::discriminant(p)
+                    == std::mem::discriminant(&self.settings.provider);
+                format!("{}{}", p.as_str(), if current { " (current)" } else { "" })
+            })
+            .collect();
+        Some((rows, self.provider_selected))
     }
 
     pub fn alerts(&self) -> Vec<AlertItem> {
@@ -1985,6 +2590,49 @@ impl App {
         });
         while self.alerts.len() > 120 {
             self.alerts.pop_back();
+        }
+    }
+
+    /// In the sessions popup: clicking the red circle deletes a session; clicking
+    /// elsewhere on a row selects it. Layout mirrors `ui::centered_rect(70, 55, …)`.
+    fn try_sessions_delete_click(&mut self, mouse: MouseEvent) {
+        let Ok((w, h)) = size() else {
+            return;
+        };
+        let term = Rect::new(0, 0, w, h);
+        let area = ui::centered_rect(70, 55, term);
+        // Content sits inside the bordered block, offset by one row/column.
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        if mouse.row < inner_y {
+            return;
+        }
+        let idx = (mouse.row - inner_y) as usize;
+        if idx >= self.sessions_menu.len() {
+            return;
+        }
+        // The red circle "● " occupies the first two content columns.
+        if mouse.column >= inner_x && mouse.column <= inner_x + 1 {
+            self.delete_session_at(idx);
+        } else {
+            self.sessions_selected = idx;
+        }
+    }
+
+    /// Clicking a row in the `/model switch` popup selects and applies that provider.
+    fn try_provider_click(&mut self, mouse: MouseEvent) {
+        let Ok((w, h)) = size() else {
+            return;
+        };
+        let area = ui::centered_rect(50, 45, Rect::new(0, 0, w, h));
+        let inner_y = area.y + 1;
+        if mouse.row < inner_y {
+            return;
+        }
+        let idx = (mouse.row - inner_y) as usize;
+        if idx < self.provider_menu.len() {
+            self.provider_selected = idx;
+            self.apply_provider_switch();
         }
     }
 
@@ -2166,6 +2814,38 @@ fn session_file_path(session_id: &str) -> PathBuf {
     sessions_root_dir().join(format!("{session_id}.json"))
 }
 
+/// Map the user-facing Anthropic model names to API model ids.
+fn anthropic_model_id(short: &str) -> Option<&'static str> {
+    // All three 4.7 tiers are selectable. Opus 4.7 is live; Sonnet/Haiku 4.7 may not be yet, in
+    // which case the provider transparently falls back to the latest tier model (4.6 / 4.5).
+    match short.trim().to_lowercase().as_str() {
+        "opus-4.7" | "opus" | "claude-opus-4-7" => Some("claude-opus-4-7"),
+        "sonnet-4.7" | "sonnet" | "claude-sonnet-4-7" => Some("claude-sonnet-4-7"),
+        "sonnet-4.6" | "claude-sonnet-4-6" => Some("claude-sonnet-4-6"),
+        "haiku-4.7" | "haiku" | "claude-haiku-4-7" => Some("claude-haiku-4-7"),
+        "haiku-4.5" | "claude-haiku-4-5-20251001" => Some("claude-haiku-4-5-20251001"),
+        _ => None,
+    }
+}
+
+/// Open a URL in the user's default browser (Linux openers, with a macOS fallback).
+fn open_in_browser(url: &str) {
+    for opener in ["xdg-open", "sensible-browser", "x-www-browser", "open"] {
+        if Command::new(opener).arg(url).spawn().is_ok() {
+            return;
+        }
+    }
+}
+
+fn delete_session_file(session_id: &str) -> Result<()> {
+    let path = session_file_path(session_id);
+    if path.exists() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to delete {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn generate_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -2188,6 +2868,18 @@ fn save_session_messages(session_id: &str, messages: &[Message]) -> Result<()> {
     };
     let text = serde_json::to_string(&file)?;
     fs::write(session_file_path(session_id), text)?;
+    Ok(())
+}
+
+/// Write an imported conversation as a session file, preserving its source timestamp.
+fn save_imported_session(session_id: &str, messages: &[Message], updated_ts: u64) -> Result<()> {
+    fs::create_dir_all(sessions_root_dir())?;
+    let file = SessionFile {
+        title: summarize_session_title(messages),
+        updated_ts,
+        messages: messages.to_vec(),
+    };
+    fs::write(session_file_path(session_id), serde_json::to_string(&file)?)?;
     Ok(())
 }
 
@@ -2271,14 +2963,14 @@ struct AutocodeFile {
     content: String,
 }
 
-fn is_coding_task(prompt: &str) -> bool {
+pub fn is_coding_task(prompt: &str) -> bool {
     let p = prompt.to_lowercase();
     ["implement", "code", "create", "build", "refactor", "fix", "edit", "update"]
         .iter()
         .any(|k| p.contains(k))
 }
 
-fn run_autonomous_coding(
+pub fn run_autonomous_coding(
     settings: &Settings,
     history: &[Message],
     prompt: &str,
@@ -2287,26 +2979,26 @@ fn run_autonomous_coding(
     coding_expanded: bool,
     cwd: &Path,
 ) -> Result<AgentResult> {
-    let raw = query_coding_actions(
+    let raw = sanitize_model_text(&query_coding_actions(
         settings,
         history,
         prompt,
         deep_think_enabled,
         deep_think_level,
         coding_expanded,
-    )?;
+    )?);
     let plan = match parse_autocode_plan(&raw) {
         Ok(p) => p,
         Err(_) => {
-            let retry_prompt = format!("{prompt}\n\nPlease include OPENCAGE_FILE/OPENCAGE_CMD blocks so actions can be executed.");
-            let retry_raw = query_coding_actions(
+            let retry_prompt = format!("{prompt}\n\nReply with OPENCAGE_FILE/OPENCAGE_CMD blocks FIRST (no markdown fences) so actions can be executed.");
+            let retry_raw = sanitize_model_text(&query_coding_actions(
                 settings,
                 history,
                 &retry_prompt,
                 deep_think_enabled,
                 deep_think_level,
                 coding_expanded,
-            )?;
+            )?);
             parse_autocode_plan(&retry_raw).with_context(|| {
                 format!(
                     "Failed to parse coding action output. Raw sample: {}",
@@ -2401,6 +3093,14 @@ fn extract_json_object(raw: &str) -> Option<String> {
     Some(raw[start..=end].to_string())
 }
 
+/// Drop control characters that never belong in code/text (keeps newlines and tabs), so a
+/// stray byte from the model can't corrupt a generated file or the displayed summary.
+fn sanitize_model_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+        .collect()
+}
+
 fn parse_autocode_plan(raw: &str) -> Result<AutocodePlan> {
     if let Some(plan) = parse_tagged_autocode(raw) {
         return Ok(plan);
@@ -2426,6 +3126,7 @@ fn parse_tagged_autocode(raw: &str) -> Option<AutocodePlan> {
     let mut cmds = Vec::new();
 
     let mut rest = raw;
+    let mut truncated = false;
     while let Some(start) = rest.find("<OPENCAGE_FILE path=\"") {
         let after = &rest[start + "<OPENCAGE_FILE path=\"".len()..];
         let Some(end_quote) = after.find('"') else {
@@ -2437,12 +3138,23 @@ fn parse_tagged_autocode(raw: &str) -> Option<AutocodePlan> {
             break;
         };
         let content_start = &after_tag[open_end + 1..];
-        let Some(close) = content_start.find("</OPENCAGE_FILE>") else {
-            break;
-        };
-        let content = content_start[..close].trim_matches('\n').to_string();
-        files.push(AutocodeFile { path, content });
-        rest = &content_start[close + "</OPENCAGE_FILE>".len()..];
+        match content_start.find("</OPENCAGE_FILE>") {
+            Some(close) => {
+                let content = content_start[..close].trim_matches('\n').to_string();
+                files.push(AutocodeFile { path, content });
+                rest = &content_start[close + "</OPENCAGE_FILE>".len()..];
+            }
+            None => {
+                // Response was cut off (token limit) before the closing tag — salvage the
+                // partial file so the work isn't lost, and flag it.
+                let content = content_start.trim_matches('\n').to_string();
+                if !content.trim().is_empty() {
+                    files.push(AutocodeFile { path, content });
+                    truncated = true;
+                }
+                break;
+            }
+        }
     }
 
     let mut rest_cmd = raw;
@@ -2459,7 +3171,7 @@ fn parse_tagged_autocode(raw: &str) -> Option<AutocodePlan> {
         }
     }
 
-    let summary = raw
+    let mut summary = raw
         .split("<OPENCAGE_FILE")
         .next()
         .unwrap_or(raw)
@@ -2468,6 +3180,14 @@ fn parse_tagged_autocode(raw: &str) -> Option<AutocodePlan> {
         .unwrap_or(raw)
         .trim()
         .to_string();
+    if truncated {
+        if !summary.is_empty() {
+            summary.push_str("\n\n");
+        }
+        summary.push_str(
+            "⚠ Output was truncated before completion — the last file may be incomplete. Ask me to continue it.",
+        );
+    }
 
     if files.is_empty() && cmds.is_empty() {
         None

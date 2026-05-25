@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Beetle Design · OpenCage</title>
+<style>
+  :root {
+    --bg: #0c0e12; --panel: #14171d; --panel-2: #181c23; --line: #262c36;
+    --text: #eceef2; --muted: #8a93a2; --accent: #6ee7a6; --accent-2: #62b0ff;
+    --danger: #ff6b6b; --radius: 13px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-rows: auto 1fr;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px; border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, #11151b, #0c0e12);
+  }
+  .bug { font-size: 24px; filter: drop-shadow(0 0 9px rgba(110,231,166,.4)); }
+  .title { font-weight: 650; letter-spacing: .2px; }
+  .title small { display:block; color: var(--muted); font-weight: 400; font-size: 12px; }
+  .spacer { flex: 1; }
+  .pill { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 5px 11px; }
+
+  .layout { display: grid; grid-template-columns: 380px 1fr; min-height: 0; }
+  @media (max-width: 820px) { .layout { grid-template-columns: 1fr; } }
+
+  /* Left: prompt + actions */
+  aside {
+    border-right: 1px solid var(--line); padding: 18px; display: flex; flex-direction: column; gap: 14px;
+    min-height: 0; overflow: auto; background: var(--panel);
+  }
+  label.cap { font-size: 11px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); }
+  textarea#idea {
+    width: 100%; min-height: 130px; resize: vertical; background: #0e1116; color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; outline: none;
+  }
+  textarea#idea:focus { border-color: var(--accent-2); }
+  .btn {
+    border: 0; border-radius: 10px; padding: 11px 16px; font: 600 14px/1 inherit; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 8px; justify-content: center;
+    transition: transform .05s ease, filter .15s ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn:disabled { opacity: .5; cursor: default; filter: grayscale(.4); }
+  .btn.primary { background: var(--accent); color: #06140d; width: 100%; }
+  .btn.blue { background: var(--accent-2); color: #04121f; }
+  .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  .btn:hover:not(:disabled) { filter: brightness(1.08); }
+  .actions { display: flex; gap: 10px; }
+  .actions .btn { flex: 1; }
+  .note { color: var(--muted); font-size: 12.5px; }
+  .status { font-size: 13px; min-height: 18px; color: var(--accent); }
+  .status.err { color: var(--danger); }
+  .examples { display:flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 12px; color: var(--muted); border:1px solid var(--line); border-radius: 999px; padding: 4px 10px; cursor: pointer; }
+  .chip:hover { color: var(--text); border-color: var(--accent-2); }
+
+  /* Right: artifact preview */
+  main { display: flex; flex-direction: column; min-height: 0; }
+  .tabs { display: flex; gap: 4px; padding: 10px 14px; border-bottom: 1px solid var(--line); align-items: center; }
+  .tab { background: transparent; border: 0; color: var(--muted); padding: 7px 13px; border-radius: 8px; cursor: pointer; font: 600 13px/1 inherit; }
+  .tab.active { background: var(--panel-2); color: var(--text); }
+  .stage { position: relative; flex: 1; min-height: 0; background:
+      repeating-conic-gradient(#0f1217 0% 25%, #0c0e12 0% 50%) 50% / 22px 22px; }
+  iframe#preview { width: 100%; height: 100%; border: 0; background: #fff; display: block; }
+  pre#code {
+    margin: 0; height: 100%; overflow: auto; padding: 16px; display: none;
+    background: #0c0e12; color: #cdd5df; font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .empty {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); text-align: center; padding: 24px; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <span class="bug">🪲</span>
+    <div class="title">Beetle Design <small>describe it → preview it live → push to OpenCage</small></div>
+    <span class="spacer"></span>
+    <span class="pill" id="conn">● live server</span>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <label class="cap" for="idea">Describe your app</label>
+      <textarea id="idea" placeholder="A pomodoro timer with start/pause/reset, a circular progress ring, and a session counter…"></textarea>
+      <div class="examples" id="examples">
+        <span class="chip">Pomodoro timer</span>
+        <span class="chip">Kanban board</span>
+        <span class="chip">Tip calculator</span>
+        <span class="chip">Snake game</span>
+      </div>
+      <button class="btn primary" id="designBtn">✦ Design it</button>
+      <div class="actions">
+        <button class="btn blue" id="pushBtn" disabled>⬢ Push to OpenCage</button>
+        <button class="btn ghost" id="downloadBtn" disabled>⭳ Download</button>
+      </div>
+      <div class="status" id="status"></div>
+      <p class="note">Push writes <code>beetle/index.html</code> into your project and saves the design to OpenCage memory (RAG). The working copy is wiped when you stop the live server.</p>
+    </aside>
+
+    <main>
+      <div class="tabs">
+        <button class="tab active" id="tabPreview">Preview</button>
+        <button class="tab" id="tabCode">Code</button>
+        <span class="spacer" style="flex:1"></span>
+        <span class="note" id="meta"></span>
+      </div>
+      <div class="stage">
+        <iframe id="preview" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-pointer-lock"></iframe>
+        <pre id="code"></pre>
+        <div class="empty" id="empty">Your interactive design will appear here.</div>
+      </div>
+    </main>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const idea = $("idea"), designBtn = $("designBtn"), pushBtn = $("pushBtn"), downloadBtn = $("downloadBtn");
+  const preview = $("preview"), code = $("code"), empty = $("empty"), status = $("status"), meta = $("meta");
+  let currentHtml = "";
+
+  $("examples").addEventListener("click", (e) => {
+    if (e.target.classList.contains("chip")) idea.value = e.target.textContent;
+  });
+  $("tabPreview").addEventListener("click", () => setTab("preview"));
+  $("tabCode").addEventListener("click", () => setTab("code"));
+  function setTab(which) {
+    const p = which === "preview";
+    $("tabPreview").classList.toggle("active", p);
+    $("tabCode").classList.toggle("active", !p);
+    preview.style.display = p ? "block" : "none";
+    code.style.display = p ? "none" : "block";
+  }
+  function setStatus(msg, err) { status.textContent = msg || ""; status.classList.toggle("err", !!err); }
+  function busy(btn, on, label) {
+    btn.disabled = on; btn.dataset.label = btn.dataset.label || btn.textContent;
+    btn.textContent = on ? label : btn.dataset.label;
+  }
+
+  designBtn.addEventListener("click", async () => {
+    const prompt = idea.value.trim();
+    if (!prompt) { idea.focus(); return; }
+    busy(designBtn, true, "Designing…"); setStatus("OpenCage is designing your app…");
+    try {
+      const r = await fetch("/api/design", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt })
+      });
+      const d = await r.json();
+      currentHtml = d.html || "";
+      preview.srcdoc = currentHtml;
+      code.textContent = currentHtml;
+      empty.style.display = "none";
+      meta.textContent = currentHtml.length.toLocaleString() + " chars";
+      pushBtn.disabled = false; downloadBtn.disabled = false;
+      setTab("preview"); setStatus("Ready — interact with it, then push or download.");
+    } catch (e) { setStatus("Error: " + e, true); }
+    busy(designBtn, false);
+  });
+
+  pushBtn.addEventListener("click", async () => {
+    if (!currentHtml) return;
+    busy(pushBtn, true, "Pushing…"); setStatus("Saving to your project and OpenCage memory…");
+    try {
+      const r = await fetch("/api/push", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ html: currentHtml })
+      });
+      const d = await r.json();
+      setStatus(d.result || "Pushed.");
+    } catch (e) { setStatus("Error: " + e, true); }
+    busy(pushBtn, false);
+  });
+
+  downloadBtn.addEventListener("click", () => {
+    if (!currentHtml) return;
+    const blob = new Blob([currentHtml], { type: "text/html" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "beetle-design.html";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setStatus("Downloaded beetle-design.html");
+  });
+
+  // Heartbeat so the server knows the tab is still open; closing it stops the live server.
+  const beat = setInterval(() => { fetch("/api/ping").catch(() => {}); }, 3000);
+  function shutdown() {
+    clearInterval(beat);
+    try { navigator.sendBeacon("/api/shutdown"); }
+    catch (e) { fetch("/api/shutdown", { method: "POST", keepalive: true }).catch(() => {}); }
+  }
+  window.addEventListener("pagehide", shutdown);
+  window.addEventListener("beforeunload", shutdown);
+</script>
+</body>
+</html>
