@@ -1,4 +1,14 @@
+<div align="center">
+
+<img src="logo.png" alt="OpenCage logo" width="200" />
+
 # OpenCage
+
+![Made with Rust](https://img.shields.io/badge/Made_with-Rust-000000?logo=rust&logoColor=white)
+&nbsp;![Edition 2024](https://img.shields.io/badge/edition-2024-DEA584?logo=rust&logoColor=white)
+&nbsp;![License: MIT](https://img.shields.io/badge/License-MIT-success.svg)
+
+</div>
 
 A fast, private **terminal AI assistant** — a TUI built in Rust on top of
 [`ratatui`](https://github.com/ratatui/ratatui) and `crossterm`. Chat with multiple
