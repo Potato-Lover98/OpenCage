@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -8,17 +9,10 @@ pub fn run_in_sandbox(command_line: &str, settings: &Settings, approved: bool) -
     if !approved {
         return Ok("Sandbox blocked: permission required. Use /blacklist approve on.".to_string());
     }
-    let tokens: Vec<String> = command_line
-        .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_'))
-        .map(|s| s.to_string())
-        .collect();
-    if let Some(hit) = tokens
-        .iter()
-        .find(|t| settings.blocked_commands.contains(t.as_str()))
-    {
-        return Ok(format!("Sandbox blocked: '{hit}' is blacklisted"));
+    if let Some(hit) = blacklisted_command(command_line, &settings.blocked_commands) {
+        return Ok(format!("I can't run that — '{hit}' is in your blacklist."));
     }
+
     let output = Command::new("bash")
         .arg("-lc")
         .arg(command_line)
@@ -37,4 +31,28 @@ pub fn run_in_sandbox(command_line: &str, settings: &Settings, approved: bool) -
         out.push_str(&stderr);
     }
     Ok(out)
+}
+
+/// Find a blacklisted command anywhere in the line. Splits on shell separators and checks both
+/// the token and its basename, so `rm`, `sudo rm`, `/bin/rm`, and `ls | rm` are all caught.
+pub fn blacklisted_command(command_line: &str, blocked: &HashSet<String>) -> Option<String> {
+    for raw in command_line.split(|c: char| {
+        c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
+    }) {
+        let tok = raw.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '-' && c != '_' && c != '.' && c != '/'
+        });
+        if tok.is_empty() {
+            continue;
+        }
+        if blocked.contains(tok) {
+            return Some(tok.to_string());
+        }
+        if let Some(base) = tok.rsplit('/').next() {
+            if base != tok && blocked.contains(base) {
+                return Some(base.to_string());
+            }
+        }
+    }
+    None
 }

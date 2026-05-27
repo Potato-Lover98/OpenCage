@@ -28,14 +28,16 @@ use walkdir::WalkDir;
 use crate::ai::image_paste::{encode_as_data_url, grab_clipboard_image};
 use crate::ai::providers::{
     provider_has_credentials, query_coding_actions, query_with_subagent, select_subagents,
-    validate_settings_keys,
+    validate_settings_keys, SubAgent,
 };
-use crate::ai::sandbox::run_in_sandbox;
+use crate::ai::sandbox;
 use crate::ai::rag::RagStore;
 use crate::ai::telegram;
 use crate::ai::voice::{
     render_level_bar, spawn_live_stt, CloudSttConfig, VoiceRecorder, VoiceSttUpdate,
 };
+use crate::ai::connect;
+use crate::ai::web;
 use crate::core::config::SettingsStore;
 use crate::core::migration::{self, MigrationSource};
 use crate::core::models::{FileNode, Message, Provider, Settings};
@@ -55,6 +57,21 @@ pub enum AlertKind {
     Success,
     Warning,
     Error,
+}
+
+/// Which panel an in-app text selection belongs to (selection never crosses panels).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelPanel {
+    Chat,
+    Files,
+}
+
+/// A click-drag text selection within one panel. `anchor`/`cursor` are absolute (col,row) cells.
+#[derive(Debug, Clone, Copy)]
+pub struct Selection {
+    pub panel: SelPanel,
+    pub anchor: (u16, u16),
+    pub cursor: (u16, u16),
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +95,7 @@ pub struct SettingsForm {
     pub moonshot: String,
     pub glm: String,
     pub copilot: String,
+    pub gemini: String,
     /// Selected source (index into `MigrationSource::all()`) for the migration row.
     pub migration_idx: usize,
     pub report: Vec<String>,
@@ -102,6 +120,40 @@ pub struct App {
     pub deep_think_enabled: bool,
     pub deep_think_level: u8,
     pub coding_expanded: bool,
+    /// When true, agent-proposed commands run automatically (still blocked by the blacklist)
+    /// instead of asking yes/no. Toggled with `/control`.
+    pub control_mode: bool,
+    /// When true, prompts are augmented with live web search results. Toggled with `/web`.
+    pub web_search: bool,
+    /// When true, a supervisor "caretaker" agent reviews complex multi-subagent answers for
+    /// hallucinations. Toggled with `/caretaker`.
+    pub caretaker: bool,
+    /// Active in-app text selection (click-drag within one panel).
+    pub selection: Option<Selection>,
+    /// Whether the current drag has moved (vs. a plain click).
+    selection_moved: bool,
+    /// Set when a finished selection should be copied to the clipboard (done in the run loop,
+    /// which has the rendered buffer).
+    selection_copy_pending: bool,
+    /// Outputs of commands run this turn, accumulated until the queue drains, then summarized.
+    command_results: Vec<(String, String)>,
+    /// Receiver for an in-flight command running on a background thread (keeps the UI responsive).
+    command_rx: Option<Receiver<(String, String)>>,
+    /// Receiver for an in-flight automatic conversation summary (auto-compaction).
+    compact_rx: Option<Receiver<String>>,
+    /// Receiver for an in-flight `/init` project analysis (written to .opencage/INIT.md).
+    init_rx: Option<Receiver<String>>,
+    /// Last time Claude Code sessions were re-synced into OpenCage.
+    last_claude_sync: Instant,
+    /// How many auto-fix rounds the agent has chained this task (capped to avoid loops).
+    agent_rounds: u32,
+    /// Time of the last Esc press, for detecting a double-Esc (stop the running command).
+    last_esc: Option<Instant>,
+    /// Process-group leader PID of a running command (set only when launched via `setsid`,
+    /// so it can be group-killed safely on double-Esc).
+    running_pid: Option<u32>,
+    /// A message typed while busy — queued to send once the current task finishes (↑ to edit).
+    queued_prompt: Option<String>,
     pub active_tab: ActiveTab,
     pub settings_form: Option<SettingsForm>,
     pub current_dir: PathBuf,
@@ -144,6 +196,16 @@ pub struct App {
     beetle_stop: Option<Arc<AtomicBool>>,
     /// URL the Beetle Design server is listening on, for reopening the browser.
     beetle_url: Option<String>,
+    /// Set the flag to stop the /connect room (host or joiner); `Some` means connected.
+    connect_stop: Option<Arc<AtomicBool>>,
+    /// Peer prompts arriving from the room, drained into the chat.
+    connect_inbox: Option<Receiver<connect::PeerMsg>>,
+    /// Write handles for connected peers (host: all; joiner: the host), for broadcasting.
+    connect_peers: Option<connect::PeerList>,
+    /// Room encryption key (also encoded in the room id).
+    connect_key: Option<[u8; 32]>,
+    /// The room id to display; `Some` means a room is active.
+    connect_room: Option<String>,
     show_provider_popup: bool,
     provider_menu: Vec<Provider>,
     provider_selected: usize,
@@ -209,6 +271,12 @@ impl App {
                 "/plugout",
                 "/bots",
                 "/beetle",
+                "/connect",
+                "/control",
+                "/web",
+                "/caretaker",
+                "/init",
+                "/recap",
             ],
             palette_selected: 0,
             chat_scroll: 0,
@@ -219,6 +287,21 @@ impl App {
             deep_think_enabled: false,
             deep_think_level: 2,
             coding_expanded: false,
+            control_mode: false,
+            web_search: false,
+            caretaker: false,
+            selection: None,
+            selection_moved: false,
+            selection_copy_pending: false,
+            command_results: Vec::new(),
+            command_rx: None,
+            compact_rx: None,
+            init_rx: None,
+            last_claude_sync: Instant::now(),
+            agent_rounds: 0,
+            last_esc: None,
+            running_pid: None,
+            queued_prompt: None,
             active_tab: ActiveTab::Chat,
             settings_form: None,
             current_dir,
@@ -254,6 +337,11 @@ impl App {
             telegram_rx: None,
             beetle_stop: None,
             beetle_url: None,
+            connect_stop: None,
+            connect_inbox: None,
+            connect_peers: None,
+            connect_key: None,
+            connect_room: None,
             show_provider_popup: false,
             provider_menu: Vec::new(),
             provider_selected: 0,
@@ -306,6 +394,9 @@ impl App {
             self.start_telegram_bot();
         }
 
+        // Pull in any Claude Code sessions created since last launch (24/7 sync).
+        self.sync_claude_sessions();
+
         while !should_quit {
             self.sync_cwd_and_tree();
             self.sync_blacklist_file();
@@ -314,20 +405,42 @@ impl App {
             self.sync_terminal_title();
             self.drain_telegram_log();
             self.sync_beetle_state();
+            self.drain_connect_inbox();
+            if self.last_claude_sync.elapsed() >= Duration::from_secs(120) {
+                self.sync_claude_sessions();
+            }
             terminal.draw(|f| ui::draw(f, self))?;
+
+            // A drag-selection just finished — copy the on-screen text to the clipboard.
+            if self.selection_copy_pending {
+                self.selection_copy_pending = false;
+                if let Some((rect, start, end)) = self.selection_region() {
+                    let text =
+                        extract_selection_text(terminal.current_buffer_mut(), rect, start, end);
+                    if !text.trim().is_empty() {
+                        match crate::ai::image_paste::copy_to_clipboard(&text) {
+                            Ok(()) => self.push_alert(
+                                AlertKind::Success,
+                                "Copied to clipboard",
+                                &format!("{} chars", text.chars().count()),
+                            ),
+                            Err(e) => {
+                                self.push_alert(AlertKind::Error, "Copy failed", &e.to_string())
+                            }
+                        }
+                    }
+                }
+            }
 
             if let Some(rx) = self.pending_response.as_ref() {
                 match rx.try_recv() {
                     Ok(result) => {
+                        let had_commands = !result.commands.is_empty();
                         let final_reply = self.filter_cuss(result.text);
                         self.messages.push(Message {
                             role: "assistant".to_string(),
                             content: final_reply.clone(),
                         });
-                        for cmd in result.commands {
-                            self.queued_commands.push_back(cmd);
-                        }
-                        self.prompt_next_command_if_needed();
                         let _ = self.rag.remember_scoped(
                             &format!("session:{}:global", self.session_id),
                             "assistant",
@@ -339,10 +452,20 @@ impl App {
                                 let _ = self.rag.remember_scoped(&scope, "assistant", line);
                             }
                         }
+                        // This query is finished. Mark it done BEFORE handling commands, so a
+                        // follow-up "summarize the output" query can claim pending_response.
                         self.busy = false;
                         self.pending_response = None;
                         self.last_status = "Ready".to_string();
                         self.chat_scroll = 0;
+                        for cmd in result.commands {
+                            self.queued_commands.push_back(cmd);
+                        }
+                        self.prompt_next_command_if_needed();
+                        // Final answer (no follow-up commands) → notify that the task is done.
+                        if !had_commands {
+                            self.push_alert(AlertKind::Success, "Task complete", "The assistant finished.");
+                        }
                     }
                     Err(TryRecvError::Disconnected) => {
                         self.busy = false;
@@ -352,6 +475,46 @@ impl App {
                     Err(TryRecvError::Empty) => {}
                 }
             }
+
+            // A backgrounded command finished — show its output and advance the queue.
+            if let Some(rx) = self.command_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok((cmd, out)) => self.on_command_finished(cmd, out),
+                    Err(TryRecvError::Disconnected) => {
+                        self.command_rx = None;
+                        self.prompt_next_command_if_needed();
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+
+            // An auto-compaction summary finished — fold it into the history.
+            if let Some(rx) = self.compact_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok(summary) => self.apply_compact(summary),
+                    Err(TryRecvError::Disconnected) => {
+                        self.compact_rx = None;
+                        self.busy = false;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+
+            // A `/init` analysis finished — write INIT.md.
+            if let Some(rx) = self.init_rx.as_ref() {
+                match rx.try_recv() {
+                    Ok(md) => self.finish_init(md),
+                    Err(TryRecvError::Disconnected) => {
+                        self.init_rx = None;
+                        self.busy = false;
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+
+            // When idle and the context is nearly full, compact it automatically.
+            self.maybe_send_queued();
+            self.maybe_auto_compact();
 
             if event::poll(tick)? {
                 match event::read()? {
@@ -366,6 +529,9 @@ impl App {
             stop.store(true, Ordering::SeqCst);
         }
         if let Some(stop) = self.beetle_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        if let Some(stop) = self.connect_stop.take() {
             stop.store(true, Ordering::SeqCst);
         }
         disable_raw_mode()?;
@@ -429,6 +595,33 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // Esc interrupts work in progress. While a command runs, a *double* Esc stops it.
+        if key.code == KeyCode::Esc
+            && self.active_tab == ActiveTab::Chat
+            && !self.show_sessions_popup
+            && !self.show_provider_popup
+            && (self.command_rx.is_some()
+                || self.busy
+                || self.compact_rx.is_some()
+                || self.pending_response.is_some())
+        {
+            let now = Instant::now();
+            let double = self
+                .last_esc
+                .is_some_and(|t| now.duration_since(t) < Duration::from_millis(700));
+            self.last_esc = Some(now);
+            if self.command_rx.is_some() {
+                if double {
+                    self.stop_running_command();
+                } else {
+                    self.last_status = "Press Esc again to stop the running command".to_string();
+                }
+            } else {
+                self.interrupt_ai();
+            }
+            return false;
         }
 
         if self.active_tab == ActiveTab::Settings {
@@ -692,8 +885,15 @@ impl App {
             KeyEvent {
                 code: KeyCode::Up, ..
             } => {
-                self.file_tree_highlight = true;
-                self.selected_file_idx = self.selected_file_idx.saturating_sub(1);
+                if let Some(q) = self.queued_prompt.take() {
+                    // Recall a queued message into the input to edit it.
+                    self.input = q;
+                    self.show_palette = self.input.starts_with('/');
+                    self.last_status = "Editing queued message — Enter to (re)send".to_string();
+                } else {
+                    self.file_tree_highlight = true;
+                    self.selected_file_idx = self.selected_file_idx.saturating_sub(1);
+                }
             }
             KeyEvent {
                 code: KeyCode::Down,
@@ -739,6 +939,7 @@ impl App {
                 ..
             } => {
                 self.input.push(ch);
+                self.try_attach_dropped_image();
                 self.show_palette = self.input.starts_with('/');
                 if !self.show_palette {
                     self.palette_selected = 0;
@@ -770,7 +971,7 @@ impl App {
                 code: KeyCode::Down,
                 ..
             } => {
-                form.selected = (form.selected + 1).min(10);
+                form.selected = (form.selected + 1).min(11);
             }
             KeyEvent {
                 code: KeyCode::Left,
@@ -815,14 +1016,14 @@ impl App {
             KeyEvent {
                 code: KeyCode::Left,
                 ..
-            } if form.selected == 10 => {
+            } if form.selected == 11 => {
                 let total = MigrationSource::all().len();
                 form.migration_idx = (form.migration_idx + total - 1) % total;
             }
             KeyEvent {
                 code: KeyCode::Right,
                 ..
-            } if form.selected == 10 => {
+            } if form.selected == 11 => {
                 let total = MigrationSource::all().len();
                 form.migration_idx = (form.migration_idx + 1) % total;
             }
@@ -835,7 +1036,7 @@ impl App {
             KeyEvent {
                 code: KeyCode::Enter,
                 ..
-            } if form.selected == 10 => {
+            } if form.selected == 11 => {
                 let source = MigrationSource::all()[form.migration_idx];
                 self.run_migration_source(source);
             }
@@ -852,7 +1053,7 @@ impl App {
                 code: KeyCode::Backspace,
                 ..
             } => {
-                if matches!(form.selected, 2 | 4 | 5 | 6 | 7 | 8 | 9) {
+                if matches!(form.selected, 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10) {
                     Self::form_field_mut(form).pop();
                 }
             }
@@ -860,7 +1061,7 @@ impl App {
                 code: KeyCode::Char(ch),
                 ..
             } => {
-                if matches!(form.selected, 2 | 4 | 5 | 6 | 7 | 8 | 9) {
+                if matches!(form.selected, 2 | 4 | 5 | 6 | 7 | 8 | 9 | 10) {
                     Self::form_field_mut(form).push(ch);
                 }
             }
@@ -878,6 +1079,7 @@ impl App {
             7 => &mut form.moonshot,
             8 => &mut form.glm,
             9 => &mut form.copilot,
+            10 => &mut form.gemini,
             _ => &mut form.avatar,
         }
     }
@@ -886,11 +1088,40 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 self.handle_chat_mouse_scroll(mouse);
-                return;
             }
-            MouseEventKind::Down(MouseButton::Left) => {}
-            _ => return,
+            MouseEventKind::Down(MouseButton::Left) => self.on_mouse_down(mouse),
+            // Accept any button for drag/release: some terminals don't tag the release with a button.
+            MouseEventKind::Drag(_) => self.on_mouse_drag(mouse),
+            MouseEventKind::Up(_) => self.on_mouse_up(mouse),
+            _ => {}
         }
+    }
+
+    /// Inner content rect of a panel (used to scope selection + clamp clicks).
+    fn panel_rect(&self, panel: SelPanel) -> Option<Rect> {
+        let (w, h) = size().ok()?;
+        let term = Rect::new(0, 0, w, h);
+        let layout =
+            ui::chat_main_layout(term, self.show_palette, self.command_approval_bar().is_some());
+        Some(match panel {
+            SelPanel::Files => ui::file_tree_content_rect(layout.files, &self.current_dir),
+            SelPanel::Chat => ui::chat_message_inner_rect(layout.chat, self),
+        })
+    }
+
+    fn panel_at(&self, col: u16, row: u16) -> Option<SelPanel> {
+        let pos = Position::new(col, row);
+        if self.panel_rect(SelPanel::Chat).is_some_and(|r| r.contains(pos)) {
+            return Some(SelPanel::Chat);
+        }
+        if self.panel_rect(SelPanel::Files).is_some_and(|r| r.contains(pos)) {
+            return Some(SelPanel::Files);
+        }
+        None
+    }
+
+    fn on_mouse_down(&mut self, mouse: MouseEvent) {
+        // Modal popups, palette, and alert buttons take an immediate click.
         if self.show_sessions_popup {
             self.try_sessions_delete_click(mouse);
             return;
@@ -905,9 +1136,8 @@ impl App {
         if self.show_palette && let Some((start, end)) = self.suggestion_row_range() {
             let row = mouse.row as usize;
             if row >= start && row < end {
-                let idx = row - start;
                 let suggestions = self.filtered_suggestions();
-                if let Some(selected) = suggestions.get(idx) {
+                if let Some(selected) = suggestions.get(row - start) {
                     self.input = (*selected).to_string();
                     self.show_palette = false;
                     self.palette_selected = 0;
@@ -918,32 +1148,134 @@ impl App {
         if self.active_tab != ActiveTab::Chat {
             return;
         }
-        let Some((w, h)) = size().ok() else {
+        // Begin a selection if the press lands inside the chat or file-tree content.
+        match self.panel_at(mouse.column, mouse.row) {
+            Some(panel) => {
+                let pos = (mouse.column, mouse.row);
+                self.selection = Some(Selection { panel, anchor: pos, cursor: pos });
+                self.selection_moved = false;
+            }
+            None => self.selection = None,
+        }
+    }
+
+    fn on_mouse_drag(&mut self, mouse: MouseEvent) {
+        let Some(sel) = self.selection else {
             return;
         };
-        let term = Rect::new(0, 0, w, h);
-        let layout = ui::chat_main_layout(
-            term,
-            self.show_palette,
-            self.command_approval_bar().is_some(),
-        );
-        let pos = Position::new(mouse.column, mouse.row);
-        let tree_inner = ui::file_tree_content_rect(layout.files, &self.current_dir);
-        if tree_inner.contains(pos) {
-            let row = mouse.row.saturating_sub(tree_inner.y) as usize;
-            if row < self.files.len() {
-                self.file_tree_highlight = true;
-                self.selected_file_idx = row;
-                if self.files[row].is_dir {
-                    self.toggle_node();
+        let Some(rect) = self.panel_rect(sel.panel) else {
+            return;
+        };
+        let cx = mouse
+            .column
+            .clamp(rect.x, rect.x + rect.width.saturating_sub(1));
+        let cy = mouse.row.clamp(rect.y, rect.y + rect.height.saturating_sub(1));
+        if let Some(s) = self.selection.as_mut() {
+            s.cursor = (cx, cy);
+            if s.cursor != s.anchor {
+                self.selection_moved = true;
+            }
+        }
+    }
+
+    fn on_mouse_up(&mut self, _mouse: MouseEvent) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        if self.selection_moved {
+            // A real drag — copy it (done in the run loop, which holds the rendered buffer).
+            self.selection_copy_pending = true;
+        } else {
+            // A plain click — drop the selection and do the panel's click action.
+            self.selection = None;
+            self.handle_panel_click(sel.panel, sel.anchor);
+        }
+    }
+
+    fn handle_panel_click(&mut self, panel: SelPanel, pos: (u16, u16)) {
+        match panel {
+            SelPanel::Files => {
+                let Some(rect) = self.panel_rect(SelPanel::Files) else {
+                    return;
+                };
+                let row = pos.1.saturating_sub(rect.y) as usize;
+                if row < self.files.len() {
+                    self.file_tree_highlight = true;
+                    self.selected_file_idx = row;
+                    if self.files[row].is_dir {
+                        self.toggle_node();
+                    }
                 }
             }
-        } else if layout.chat.contains(pos)
-            || layout.footer.contains(pos)
-            || (layout.palette.height > 0 && layout.palette.contains(pos))
-        {
-            self.file_tree_highlight = false;
+            SelPanel::Chat => self.file_tree_highlight = false,
         }
+    }
+
+    /// Dragging an image file onto the input types its path; detect a trailing .png/.jpg/.jpeg
+    /// path and turn it into an attachment shown as `[image 1]` (the model receives the image).
+    fn try_attach_dropped_image(&mut self) {
+        let t = self.input.trim_end();
+        if t.is_empty() {
+            return;
+        }
+        // Pull the trailing path token (handle 'single', "double" quotes, or a bare token).
+        let (candidate, prefix) = if let Some(body) = t.strip_suffix('\'') {
+            match body.rfind('\'') {
+                Some(i) => (body[i + 1..].to_string(), body[..i].to_string()),
+                None => return,
+            }
+        } else if let Some(body) = t.strip_suffix('"') {
+            match body.rfind('"') {
+                Some(i) => (body[i + 1..].to_string(), body[..i].to_string()),
+                None => return,
+            }
+        } else {
+            match t.rfind(char::is_whitespace) {
+                Some(i) => (t[i + 1..].to_string(), t[..i + 1].to_string()),
+                None => (t.to_string(), String::new()),
+            }
+        };
+        let path_str = candidate
+            .trim()
+            .trim_start_matches("file://")
+            .replace("\\ ", " ");
+        let lower = path_str.to_lowercase();
+        if !(lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+            return;
+        }
+        let path = PathBuf::from(&path_str);
+        if !path.is_file() {
+            return;
+        }
+        self.attached_image_path = Some(path);
+        let prefix = prefix.trim_end();
+        self.input = if prefix.is_empty() {
+            "[image 1]".to_string()
+        } else {
+            format!("{prefix} [image 1]")
+        };
+        self.show_palette = false;
+        self.push_alert(
+            AlertKind::Info,
+            "Image attached",
+            "It'll be sent with your next message as [image 1].",
+        );
+    }
+
+    /// Normalized selection region: panel rect + ordered (start, end) cells, clamped to the panel.
+    pub fn selection_region(&self) -> Option<(Rect, (u16, u16), (u16, u16))> {
+        let sel = self.selection?;
+        let rect = self.panel_rect(sel.panel)?;
+        let clamp = |p: (u16, u16)| {
+            (
+                p.0.clamp(rect.x, rect.x + rect.width.saturating_sub(1)),
+                p.1.clamp(rect.y, rect.y + rect.height.saturating_sub(1)),
+            )
+        };
+        let a = clamp(sel.anchor);
+        let b = clamp(sel.cursor);
+        let (start, end) = if (a.1, a.0) <= (b.1, b.0) { (a, b) } else { (b, a) };
+        Some((rect, start, end))
     }
 
     /// Wheel over chat: scroll history (like WhatsApp). Up = older, down = newer.
@@ -979,7 +1311,18 @@ impl App {
 
     fn handle_enter(&mut self) {
         let raw = self.input.trim().to_string();
-        if raw.is_empty() || self.busy {
+        if raw.is_empty() {
+            return;
+        }
+        // Busy with a task? Queue the message instead of dropping it (↑ recalls it to edit).
+        if self.busy || self.command_rx.is_some() || self.compact_rx.is_some() || self.init_rx.is_some() {
+            self.queued_prompt = Some(match self.queued_prompt.take() {
+                Some(prev) => format!("{prev}\n{raw}"),
+                None => raw,
+            });
+            self.input.clear();
+            self.last_status = "Message queued — sends when the task finishes (↑ to edit)".to_string();
+            self.push_system_message("📨 Queued — I'll send this when the current task finishes. Press ↑ to edit it.");
             return;
         }
         self.input.clear();
@@ -1045,6 +1388,8 @@ impl App {
             role: "user".to_string(),
             content: user_text.clone(),
         });
+        // Share the prompt with anyone in a /connect room.
+        self.broadcast_to_room(&user_text);
         self.chat_scroll = 0;
         let _ = self.rag.remember_scoped(
             &format!("session:{}:global", self.session_id),
@@ -1070,6 +1415,7 @@ impl App {
         }
 
         self.busy = true;
+        self.agent_rounds = 0; // fresh task — reset the auto-fix round counter
         self.last_status = "Contacting cloud provider...".to_string();
         let (tx, rx) = mpsc::channel();
         let settings = self.settings.clone();
@@ -1078,7 +1424,17 @@ impl App {
         let deep_think_enabled = self.deep_think_enabled;
         let deep_think_level = self.deep_think_level;
         let coding_expanded = self.coding_expanded;
+        let web_search = self.web_search;
         let selected_agents = select_subagents(&user_text);
+        // The caretaker oversees complex tasks (more than one subagent engaged).
+        let caretaker_active = self.caretaker && selected_agents.len() > 1;
+        if caretaker_active {
+            let names: Vec<&str> = selected_agents.iter().map(|a| a.name()).collect();
+            self.push_system_message(&format!(
+                "🩺 Caretaker watching subagents: {}",
+                names.join(", ")
+            ));
+        }
         let mut rag_per_agent: Vec<(String, Vec<String>)> = vec![];
         for agent in &selected_agents {
             let scope = format!("session:{}:agent:{}", self.session_id, agent.name());
@@ -1096,12 +1452,22 @@ impl App {
             }
         });
         std::thread::spawn(move || {
+            // Pull live web results once, shared across sub-agents, when /web is on.
+            let web_ctx = if web_search {
+                web::search(&user_text, 5)
+            } else {
+                None
+            };
             let mut replies = Vec::new();
+            let mut commands = Vec::new();
             for (idx, agent) in selected_agents.iter().enumerate() {
-                let rag_context = rag_per_agent
+                let mut rag_context = rag_per_agent
                     .get(idx)
                     .map(|(_, c)| c.clone())
                     .unwrap_or_default();
+                if let Some(w) = &web_ctx {
+                    rag_context.push(w.clone());
+                }
                 let response = query_with_subagent(
                     &settings,
                     &context_messages,
@@ -1116,12 +1482,29 @@ impl App {
                     image_data_url.as_deref(),
                 )
                 .unwrap_or_else(|e| format!("Provider error [{}]: {e}", agent.name()));
-                replies.push(response);
+                // The model can request real commands via <OPENCAGE_CMD> blocks; pull them out so
+                // they actually run (approval/blacklist/control apply) instead of being faked.
+                commands.extend(extract_commands(&response));
+                let shown = strip_cmd_blocks(&response);
+                replies.push(if shown.is_empty() {
+                    "Running the requested command…".to_string()
+                } else {
+                    shown
+                });
             }
             let reply = replies.join("\n\n");
+            // Caretaker pass: review the combined answer for hallucinations on complex tasks.
+            let reply = if caretaker_active {
+                match caretaker_review(&settings, &user_text, &reply) {
+                    Some(correction) => format!("{reply}\n\n🩺 Caretaker: {correction}"),
+                    None => reply,
+                }
+            } else {
+                reply
+            };
             let _ = tx.send(AgentResult {
                 text: reply,
-                commands: vec![],
+                commands,
             });
         });
         self.pending_response = Some(rx);
@@ -1140,7 +1523,7 @@ impl App {
             }
             "/help" => {
                 self.push_system_message(
-                    "Commands: /alerts /settings /avatar /model[ switch] /buddy /btw /new /sessions /blacklist /clear /refresh /remember /memories /deep(on|off|0-10) /expand(on|off) /migration(claude|openclaw|hermes) /anthropic models <opus-4.7|sonnet-4.7|haiku-4.7> /plugins [available] /plugout <name> /bots <token> /beetle",
+                    "Commands: /alerts /settings /avatar /model[ switch] /buddy /btw /new /sessions /blacklist /clear /refresh /remember /memories /deep(on|off|0-10) /expand(on|off) /migration(claude|openclaw|hermes) /anthropic models <opus-4.7|sonnet-4.7|haiku-4.7> /plugins [available] /plugout <name> /bots <token> /beetle /connect <create|join <id>|stop> /control [on|off] /web [on|off] /caretaker [on|off] /init /recap",
                 );
             }
             "/buddy" => {
@@ -1455,7 +1838,104 @@ impl App {
                     _ => self.push_system_message("Usage: /plugout <name>"),
                 }
             }
+            "/control" => {
+                match parts.next().unwrap_or_default() {
+                    "on" => self.control_mode = true,
+                    "off" => self.control_mode = false,
+                    "" => self.control_mode = !self.control_mode,
+                    other => {
+                        self.push_system_message(&format!(
+                            "Usage: /control [on|off] (didn't understand '{other}')"
+                        ));
+                        return;
+                    }
+                }
+                let (state, detail) = if self.control_mode {
+                    (
+                        "ON",
+                        "I'll run the commands I propose automatically — anything in your /blacklist is still refused.",
+                    )
+                } else {
+                    ("OFF", "I'll ask you yes/no before running any command.")
+                };
+                self.push_alert(AlertKind::Warning, "Computer control", &format!("Control is {state}"));
+                self.push_system_message(&format!("Computer control is {state}. {detail}"));
+            }
+            "/init" => self.start_init(),
+            "/recap" => {
+                let path = self.current_dir.join(".opencage").join("INIT.md");
+                match fs::read_to_string(&path) {
+                    Ok(md) => {
+                        self.messages.push(Message {
+                            role: "system".to_string(),
+                            content: format!(
+                                "📖 Project context (INIT.md) — rely on this to stay grounded and avoid hallucinating:\n{md}"
+                            ),
+                        });
+                        self.push_alert(AlertKind::Info, "Recap loaded", "INIT.md is back in context.");
+                        self.last_status = "Recapped INIT.md".to_string();
+                    }
+                    Err(_) => self.push_system_message(
+                        "No .opencage/INIT.md yet — run /init first to create it.",
+                    ),
+                }
+            }
+            "/caretaker" => {
+                match parts.next().unwrap_or_default() {
+                    "on" => self.caretaker = true,
+                    "off" => self.caretaker = false,
+                    "" => self.caretaker = !self.caretaker,
+                    other => {
+                        self.push_system_message(&format!(
+                            "Usage: /caretaker [on|off] (didn't understand '{other}')"
+                        ));
+                        return;
+                    }
+                }
+                self.push_system_message(if self.caretaker {
+                    "🩺 Caretaker ON — on complex tasks I'll show the engaged subagents, and a supervisor agent will check their answers for hallucinations and correct them."
+                } else {
+                    "Caretaker OFF."
+                });
+            }
+            "/web" => {
+                match parts.next().unwrap_or_default() {
+                    "on" => self.web_search = true,
+                    "off" => self.web_search = false,
+                    "" => self.web_search = !self.web_search,
+                    other => {
+                        self.push_system_message(&format!(
+                            "Usage: /web [on|off] (didn't understand '{other}')"
+                        ));
+                        return;
+                    }
+                }
+                self.push_system_message(if self.web_search {
+                    "Web search is ON — I'll pull live web results into context before answering."
+                } else {
+                    "Web search is OFF."
+                });
+            }
             "/beetle" => self.start_beetle(),
+            "/connect" => {
+                let args = parts.collect::<Vec<_>>();
+                match args.as_slice() {
+                    ["create"] => self.connect_create(),
+                    ["join", id] => self.connect_join(id),
+                    ["stop"] | ["leave"] => self.stop_connect(),
+                    ["status"] | [] => match &self.connect_room {
+                        Some(room) => {
+                            self.push_system_message(&format!("Connected. Room id:\n  {room}"))
+                        }
+                        None => self.push_system_message(
+                            "Not connected. Use /connect create to host a room, or /connect join <id>.",
+                        ),
+                    },
+                    _ => self.push_system_message(
+                        "Usage: /connect <create | join <room id> | stop | status>",
+                    ),
+                }
+            }
             "/bots" => {
                 let args = parts.collect::<Vec<_>>();
                 match args.as_slice() {
@@ -1991,16 +2471,23 @@ impl App {
 
     fn start_autocode(&mut self, prompt: String) {
         self.busy = true;
+        self.agent_rounds = 0;
         self.last_status = "Autonomous coding in progress...".to_string();
+        if self.caretaker {
+            self.push_system_message(
+                "🩺 Caretaker overseeing the Coding subagent — I'll review the result for hallucinations.",
+            );
+        }
         let settings = self.settings.clone();
         let history = self.messages.clone();
         let deep_think_enabled = self.deep_think_enabled;
         let deep_think_level = self.deep_think_level;
         let coding_expanded = self.coding_expanded;
         let cwd = self.current_dir.clone();
+        let caretaker = self.caretaker;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = run_autonomous_coding(
+            let mut result = run_autonomous_coding(
                 &settings,
                 &history,
                 &prompt,
@@ -2013,27 +2500,155 @@ impl App {
                 text: format!("Autocode failed: {e}"),
                 commands: vec![],
             });
+            // Caretaker reviews the coding summary for hallucinated files/output.
+            if caretaker {
+                if let Some(correction) = caretaker_review(&settings, &prompt, &result.text) {
+                    result.text.push_str(&format!("\n\n🩺 Caretaker: {correction}"));
+                }
+            }
             let _ = tx.send(result);
         });
         self.pending_response = Some(rx);
     }
 
+    /// Advance the command queue: don't act while one is running or awaiting approval; otherwise
+    /// run the next (auto in control mode, else ask), or summarize once they're all done.
     fn prompt_next_command_if_needed(&mut self) {
-        if self.pending_command.is_some() {
+        if self.pending_command.is_some() || self.command_rx.is_some() {
             return;
         }
         if let Some(cmd) = self.queued_commands.pop_front() {
-            self.pending_command = Some(cmd);
-            self.command_approval_yes = true;
-            self.last_status = "Command approval required".to_string();
-            if let Some(pending) = self.pending_command.as_ref() {
-                self.push_alert(
-                    AlertKind::Warning,
-                    "Command approval requested",
-                    &format!("Approve or deny: {pending}"),
-                );
+            if self.control_mode {
+                self.spawn_command(cmd);
+            } else {
+                self.pending_command = Some(cmd);
+                self.command_approval_yes = true;
+                self.last_status = "Command approval required".to_string();
+                if let Some(pending) = self.pending_command.as_ref() {
+                    self.push_alert(
+                        AlertKind::Warning,
+                        "Command approval requested",
+                        &format!("Approve or deny: {pending}"),
+                    );
+                }
             }
+            return;
         }
+        // Queue drained — summarize everything that ran.
+        if !self.command_results.is_empty() {
+            let results = std::mem::take(&mut self.command_results);
+            self.start_command_summary(results);
+        }
+    }
+
+    /// Run a command on a background thread so the TUI never freezes; the result is collected in
+    /// the main loop via `command_rx`.
+    fn spawn_command(&mut self, cmd: String) {
+        use std::process::Stdio;
+        // Refuse blacklisted commands without spawning anything.
+        if let Some(hit) = sandbox::blacklisted_command(&cmd, &self.settings.blocked_commands) {
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send((cmd, format!("I can't run that — '{hit}' is in your blacklist.")));
+            self.command_rx = Some(rx);
+            return;
+        }
+        self.last_status = format!("Running: {cmd}");
+        // Launch in its own session via `setsid` so Esc-Esc can group-kill it safely. Fall back to
+        // plain bash if setsid is missing (then no group-kill — Esc-Esc only stops waiting).
+        let (child, used_setsid) = match Command::new("setsid")
+            .arg("bash")
+            .arg("-lc")
+            .arg(&cmd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => (Some(c), true),
+            Err(_) => (
+                Command::new("bash")
+                    .arg("-lc")
+                    .arg(&cmd)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .ok(),
+                false,
+            ),
+        };
+        let Some(child) = child else {
+            let (tx, rx) = mpsc::channel();
+            let _ = tx.send((cmd, "error: failed to start the command".to_string()));
+            self.command_rx = Some(rx);
+            return;
+        };
+        // Only record the PID for group-kill when it's a setsid session leader (safe to kill -PID).
+        self.running_pid = if used_setsid { Some(child.id()) } else { None };
+        let (tx, rx) = mpsc::channel();
+        self.command_rx = Some(rx);
+        std::thread::spawn(move || {
+            let out = match child.wait_with_output() {
+                Ok(o) => {
+                    let mut s = String::new();
+                    let so = String::from_utf8_lossy(&o.stdout);
+                    let se = String::from_utf8_lossy(&o.stderr);
+                    if !so.trim().is_empty() {
+                        s.push_str(&so);
+                    }
+                    if !se.trim().is_empty() {
+                        if !s.is_empty() {
+                            s.push('\n');
+                        }
+                        s.push_str(&se);
+                    }
+                    s
+                }
+                Err(e) => format!("error: {e}"),
+            };
+            let _ = tx.send((cmd, out));
+        });
+    }
+
+    /// Stop interpreting the in-flight AI response (the background thread is left to finish, but
+    /// its result is discarded).
+    fn interrupt_ai(&mut self) {
+        self.pending_response = None;
+        self.compact_rx = None;
+        self.init_rx = None;
+        self.busy = false;
+        self.queued_commands.clear();
+        self.command_results.clear();
+        self.pending_command = None;
+        self.agent_rounds = 0;
+        self.last_status = "Interrupted".to_string();
+        self.push_system_message("⏹ Interrupted — discarded the response.");
+    }
+
+    /// Esc-Esc: stop the running command (group-kill if it was started via setsid).
+    fn stop_running_command(&mut self) {
+        if let Some(pid) = self.running_pid.take() {
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(format!("-{pid}"))
+                .status();
+        }
+        self.command_rx = None;
+        self.queued_commands.clear();
+        self.command_results.clear();
+        self.agent_rounds = 0;
+        self.busy = false;
+        self.last_status = "Command stopped".to_string();
+        self.push_system_message("⏹ Stopped the running command.");
+    }
+
+    /// Called when a backgrounded command finishes: show its output and advance the queue.
+    fn on_command_finished(&mut self, cmd: String, out: String) {
+        self.command_rx = None;
+        self.running_pid = None;
+        self.push_alert(AlertKind::Success, "Command finished", &cmd);
+        let shown: String = out.chars().take(2000).collect();
+        self.push_system_message(&format!("$ {cmd}\n{shown}"));
+        self.command_results.push((cmd, out));
+        self.prompt_next_command_if_needed();
     }
 
     fn apply_pending_command_choice(&mut self, approved: bool) {
@@ -2041,24 +2656,277 @@ impl App {
             return;
         };
         if approved {
-            match run_in_sandbox(&cmd, &self.settings, true) {
-                Ok(_) => self.push_alert(
-                    AlertKind::Success,
-                    "Command executed",
-                    &cmd,
-                ),
-                Err(e) => self.push_alert(
-                    AlertKind::Error,
-                    "Command execution failed",
-                    &format!("{cmd} -> {e}"),
-                ),
-            }
-            self.last_status = "command approved".to_string();
+            self.spawn_command(cmd); // runs in the background; result handled in the run loop
         } else {
             self.push_alert(AlertKind::Info, "Command denied", &cmd);
+            self.command_results
+                .push((cmd, "(denied by the user — not run)".to_string()));
             self.last_status = "command denied".to_string();
+            self.prompt_next_command_if_needed();
         }
-        self.prompt_next_command_if_needed();
+    }
+
+    /// Feed the just-run command output(s) back to the model for a short summary reply.
+    /// Send a queued message once the current task is fully finished.
+    fn maybe_send_queued(&mut self) {
+        if self.queued_prompt.is_none()
+            || self.busy
+            || self.command_rx.is_some()
+            || self.compact_rx.is_some()
+            || self.init_rx.is_some()
+            || self.pending_response.is_some()
+            || self.pending_command.is_some()
+            || self.pending_trust_prompt
+            || !self.queued_commands.is_empty()
+        {
+            return;
+        }
+        if let Some(q) = self.queued_prompt.take() {
+            self.input = q;
+            self.handle_enter();
+        }
+    }
+
+    /// Auto-compact: when the context is nearly full, summarize the conversation in the
+    /// background and replace the history with that summary (like `/compact`, but automatic).
+    fn maybe_auto_compact(&mut self) {
+        if self.busy
+            || self.command_rx.is_some()
+            || self.compact_rx.is_some()
+            || self.pending_command.is_some()
+            || self.pending_response.is_some()
+            || self.messages.len() < 8
+        {
+            return;
+        }
+        let limit = self.context_window_limit_chars.max(1);
+        if self.context_usage_chars().saturating_mul(100) / limit < 90 {
+            return;
+        }
+        self.busy = true;
+        self.last_status = "Auto-compacting context…".to_string();
+        self.push_system_message("📦 Context is nearly full — summarizing the conversation to keep going…");
+        let (tx, rx) = mpsc::channel();
+        let settings = self.settings.clone();
+        let history = self.messages.clone();
+        std::thread::spawn(move || {
+            let prompt = "Summarize the entire conversation so far into a concise but complete \
+                          summary. Preserve all key facts, decisions, code, file paths, commands run, \
+                          and the user's goals, so it can be used as the sole context to continue \
+                          seamlessly. Output only the summary.";
+            let raw = query_with_subagent(
+                &settings, &history, prompt, false, false, false, 2, false,
+                SubAgent::General, &[], None,
+            )
+            .unwrap_or_else(|e| format!("(summary failed: {e})"));
+            // Drop the leading "[avatar]" tag if present.
+            let summary = raw
+                .trim()
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .map(|(_, rest)| rest.trim().to_string())
+                .unwrap_or_else(|| raw.trim().to_string());
+            let _ = tx.send(summary);
+        });
+        self.compact_rx = Some(rx);
+    }
+
+    /// Replace the history with the auto-compaction summary plus the few most recent messages.
+    fn apply_compact(&mut self, summary: String) {
+        self.compact_rx = None;
+        self.busy = false;
+        if summary.trim().is_empty() {
+            self.last_status = "Auto-compact produced nothing; keeping history".to_string();
+            return;
+        }
+        let tail: Vec<Message> = self.messages.iter().rev().take(4).rev().cloned().collect();
+        let mut compacted = vec![Message {
+            role: "system".to_string(),
+            content: format!(
+                "📦 Earlier conversation summary (auto-compacted to save context):\n{summary}"
+            ),
+        }];
+        compacted.extend(tail);
+        self.messages = compacted;
+        self.last_persisted_messages_len = 0;
+        self.last_status = "Context auto-compacted".to_string();
+        self.push_alert(AlertKind::Info, "Context compacted", "Older messages were summarized to free up context.");
+    }
+
+    /// A snapshot of the project (file listing + key manifests) for `/init` to analyze.
+    fn project_snapshot(&self) -> String {
+        let mut out = format!("Working directory: {}\n\nFiles:\n", self.current_dir.display());
+        let mut count = 0;
+        for e in WalkDir::new(&self.current_dir)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|x| x.ok())
+        {
+            if count >= 200 {
+                break;
+            }
+            let p = e.path();
+            if p.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some(".git") | Some("target") | Some("node_modules") | Some(".opencage")
+                )
+            }) {
+                continue;
+            }
+            if let Ok(rel) = p.strip_prefix(&self.current_dir) {
+                if !rel.as_os_str().is_empty() {
+                    out.push_str(&format!("  {}\n", rel.display()));
+                    count += 1;
+                }
+            }
+        }
+        for name in [
+            "Cargo.toml",
+            "package.json",
+            "pyproject.toml",
+            "go.mod",
+            "README.md",
+        ] {
+            if let Ok(content) = fs::read_to_string(self.current_dir.join(name)) {
+                let snippet: String = content.chars().take(2000).collect();
+                out.push_str(&format!("\n--- {name} ---\n{snippet}\n"));
+            }
+        }
+        out
+    }
+
+    /// `/init`: analyze the project and write `.opencage/INIT.md`.
+    fn start_init(&mut self) {
+        if self.busy {
+            self.push_system_message("Busy right now — try /init again in a moment.");
+            return;
+        }
+        self.busy = true;
+        self.last_status = "Analyzing project for INIT.md…".to_string();
+        self.push_system_message("🔎 Analyzing the codebase to build .opencage/INIT.md…");
+        let snapshot = self.project_snapshot();
+        let prompt = format!(
+            "Analyze this project and write a concise INIT.md in Markdown. Include: a one-paragraph \
+             overview, the main structure / key files and their roles, conventions, how to build and \
+             run it, and an 'Open questions' section listing anything you'd want the developer to \
+             clarify. Output ONLY the markdown.\n\n{snapshot}"
+        );
+        let (tx, rx) = mpsc::channel();
+        let settings = self.settings.clone();
+        std::thread::spawn(move || {
+            let raw = query_with_subagent(
+                &settings, &[], &prompt, false, false, false, 2, false, SubAgent::Research, &[], None,
+            )
+            .unwrap_or_else(|e| format!("INIT generation failed: {e}"));
+            let md = raw
+                .trim()
+                .strip_prefix('[')
+                .and_then(|r| r.split_once(']'))
+                .map(|(_, rest)| rest.trim().to_string())
+                .unwrap_or_else(|| raw.trim().to_string());
+            let _ = tx.send(md);
+        });
+        self.init_rx = Some(rx);
+    }
+
+    /// Write the generated INIT.md to `.opencage/INIT.md` and show it.
+    fn finish_init(&mut self, md: String) {
+        self.init_rx = None;
+        self.busy = false;
+        let dir = self.current_dir.join(".opencage");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("INIT.md");
+        match fs::write(&path, &md) {
+            Ok(()) => {
+                self.push_system_message(&format!("✅ Wrote {}\n\n{md}", path.display()));
+                self.push_alert(AlertKind::Success, "INIT.md created", &path.display().to_string());
+                self.last_status = "INIT.md written".to_string();
+            }
+            Err(e) => self.push_system_message(&format!("Failed to write INIT.md: {e}")),
+        }
+    }
+
+    /// Feed the just-run command output back to the model. If it errored or the task isn't done,
+    /// the model fixes it (edits files / runs more commands) and the loop continues; otherwise it
+    /// returns a summary and stops. Bounded by `agent_rounds` so it can't loop forever.
+    fn start_command_summary(&mut self, results: Vec<(String, String)>) {
+        if self.busy {
+            return;
+        }
+        self.agent_rounds += 1;
+        if self.agent_rounds > 8 {
+            self.agent_rounds = 0;
+            self.push_system_message(
+                "⚠ I've made several attempts without fully resolving it. Pausing the auto-fix loop — tell me how you'd like to continue.",
+            );
+            return;
+        }
+        let mut block = String::from(
+            "I ran the command(s) below on the user's computer; here is the REAL output. If anything \
+             ERRORED or the task isn't complete, FIX it now: write/modify files with \
+             <OPENCAGE_FILE path=\"relative/path\">...full content...</OPENCAGE_FILE> and run commands \
+             with <OPENCAGE_CMD>command</OPENCAGE_CMD>. If everything succeeded, reply with a short \
+             summary and NO blocks.\n\n",
+        );
+        for (cmd, out) in &results {
+            let o: String = out.chars().take(4000).collect();
+            block.push_str(&format!("$ {cmd}\nOutput:\n{o}\n\n"));
+        }
+        self.busy = true;
+        self.last_status = "Reviewing output…".to_string();
+        let (tx, rx) = mpsc::channel();
+        let settings = self.settings.clone();
+        let history = self.messages.clone();
+        let cwd = self.current_dir.clone();
+        let avatar = self.settings.ai_avatar.clone();
+        std::thread::spawn(move || {
+            let raw = query_coding_actions(&settings, &history, &block, false, 2, true)
+                .unwrap_or_else(|e| format!("(error: {e})"));
+            let result = match parse_tagged_autocode(&raw) {
+                // The model wants to keep working: apply file edits, queue the commands to chain.
+                Some(plan) => {
+                    let mut written = Vec::new();
+                    let mut diffs = Vec::new();
+                    if let Some(files) = plan.files {
+                        for f in files {
+                            if let Some(full) = safe_join_under(&cwd, &f.path) {
+                                if let Some(parent) = full.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                let old = fs::read_to_string(&full).unwrap_or_default();
+                                let diff = render_diff(&f.path, &old, &f.content);
+                                if fs::write(&full, &f.content).is_ok() {
+                                    written.push(f.path);
+                                    diffs.push(diff);
+                                }
+                            }
+                        }
+                    }
+                    let cmds = plan.commands.unwrap_or_default();
+                    let mut text = plan
+                        .summary
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "Working on the fix…".to_string());
+                    if !diffs.is_empty() {
+                        text.push_str(&format!("\n\n{}", diffs.join("\n")));
+                    }
+                    AgentResult { text, commands: cmds }
+                }
+                // No action blocks → the model considers it done; show its summary.
+                None => {
+                    let text = strip_cmd_blocks(&raw);
+                    let text = if reply_is_blank(&text) {
+                        format!("[{avatar}] Done ✓ — that finished. What would you like me to do next?")
+                    } else {
+                        text
+                    };
+                    AgentResult { text, commands: vec![] }
+                }
+            };
+            let _ = tx.send(result);
+        });
+        self.pending_response = Some(rx);
     }
 
     fn collect_nodes(&self, root: &Path, depth: usize, target: &mut Vec<FileNode>) {
@@ -2168,6 +3036,7 @@ impl App {
             moonshot: self.settings.moonshot_api_key.clone().unwrap_or_default(),
             glm: self.settings.glm_api_key.clone().unwrap_or_default(),
             copilot: self.settings.github_copilot_token.clone().unwrap_or_default(),
+            gemini: self.settings.gemini_api_key.clone().unwrap_or_default(),
             migration_idx: 0,
             report: vec!["Press Ctrl+S to save, F5 to validate, Esc to close".to_string()],
         });
@@ -2213,6 +3082,11 @@ impl App {
         } else {
             Some(form.copilot.clone())
         };
+        s.gemini_api_key = if form.gemini.trim().is_empty() {
+            None
+        } else {
+            Some(form.gemini.clone())
+        };
         s
     }
 
@@ -2241,6 +3115,23 @@ impl App {
                 }
             }
             self.settings_form = Some(form);
+        }
+    }
+
+    /// Re-import Claude Code conversations into OpenCage's session store (idempotent — overwrites
+    /// by id). Runs on launch and periodically, so new Claude Code sessions are always available.
+    fn sync_claude_sessions(&mut self) {
+        self.last_claude_sync = Instant::now();
+        let sessions = migration::claude_sessions();
+        let mut n = 0;
+        for s in &sessions {
+            let id = format!("{}-{}", MigrationSource::ClaudeCode.id_prefix(), s.source_id);
+            if save_imported_session(&id, &s.messages, s.updated_ts).is_ok() {
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.last_status = format!("Synced {n} Claude Code session(s)");
         }
     }
 
@@ -2444,6 +3335,129 @@ impl App {
         }
     }
 
+    /// `/connect create`: host an encrypted room and print shareable room ids.
+    fn connect_create(&mut self) {
+        if self.connect_stop.is_some() {
+            self.push_system_message(
+                "Already in a room. Use /connect stop first, then /connect create.",
+            );
+            return;
+        }
+        let listener = match std::net::TcpListener::bind("0.0.0.0:0") {
+            Ok(l) => l,
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Room failed to start", &e.to_string());
+                return;
+            }
+        };
+        let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+        let key = connect::new_key();
+        let peers = connect::new_peers();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let peers_bg = peers.clone();
+            let stop_bg = stop.clone();
+            std::thread::spawn(move || connect::host_room(listener, key, peers_bg, tx, stop_bg));
+        }
+        let lan_id = connect::make_room_id(&connect::local_ip(), port, &key);
+        let public_id = connect::public_ip().map(|ip| connect::make_room_id(&ip, port, &key));
+        self.connect_stop = Some(stop);
+        self.connect_inbox = Some(rx);
+        self.connect_peers = Some(peers);
+        self.connect_key = Some(key);
+        self.connect_room = Some(lan_id.clone());
+
+        self.push_alert(
+            AlertKind::Success,
+            "Room created",
+            "Encrypted room is live — share a room id to invite others.",
+        );
+        let mut msg = format!(
+            "Encrypted room started (AES-256-GCM) on port {port}.\n\nSame network (LAN) — share this:\n  {lan_id}"
+        );
+        match public_id {
+            Some(pid) => msg.push_str(&format!(
+                "\n\nOver the internet — share this:\n  {pid}\n(For this to reach you, inbound TCP on port {port} must be open — home routers usually block it unless you port-forward.)"
+            )),
+            None => msg.push_str("\n\n(Couldn't determine your public IP — only the LAN id is available.)"),
+        }
+        msg.push_str("\n\nOthers join with: /connect join <room id>. Stop anytime with /connect stop.");
+        self.push_system_message(&msg);
+        self.last_status = format!("Hosting encrypted room on :{port}");
+    }
+
+    /// `/connect join <id>`: connect to an existing room.
+    fn connect_join(&mut self, id: &str) {
+        if self.connect_stop.is_some() {
+            self.push_system_message("Already in a room. Use /connect stop first.");
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        match connect::join_room(id, &self.settings.ai_avatar, tx, stop.clone()) {
+            Ok((peers, key)) => {
+                self.connect_stop = Some(stop);
+                self.connect_inbox = Some(rx);
+                self.connect_peers = Some(peers);
+                self.connect_key = Some(key);
+                self.connect_room = Some(id.to_string());
+                self.push_alert(AlertKind::Success, "Joined room", "Connected — prompts are now shared.");
+                self.push_system_message(
+                    "Joined the room. Prompts you send are shared with everyone connected. Leave with /connect stop.",
+                );
+                self.last_status = "Connected to room".to_string();
+            }
+            Err(e) => {
+                self.push_alert(AlertKind::Error, "Join failed", &e.to_string());
+                self.push_system_message(&format!("Could not join room: {e}"));
+            }
+        }
+    }
+
+    /// `/connect stop`: leave / shut down the room so no one can reach it.
+    fn stop_connect(&mut self) {
+        let was_connected = self.connect_room.take().is_some();
+        if let Some(stop) = self.connect_stop.take() {
+            stop.store(true, Ordering::SeqCst);
+        }
+        self.connect_inbox = None;
+        self.connect_peers = None; // dropping peer streams disconnects everyone
+        self.connect_key = None;
+        if was_connected {
+            self.push_system_message("Left the room and closed the connection — it's no longer reachable.");
+            self.last_status = "Room stopped".to_string();
+        } else {
+            self.push_system_message("Not connected to any room.");
+        }
+    }
+
+    /// Send a prompt to everyone in the room (if connected).
+    fn broadcast_to_room(&self, text: &str) {
+        if let (Some(peers), Some(key)) = (&self.connect_peers, &self.connect_key) {
+            if let Some(line) = connect::encode_msg(key, &self.settings.ai_avatar, text) {
+                connect::forward(peers, &line, None);
+            }
+        }
+    }
+
+    /// Surface peer prompts from the room as chat messages.
+    fn drain_connect_inbox(&mut self) {
+        let mut incoming = Vec::new();
+        if let Some(rx) = self.connect_inbox.as_ref() {
+            while let Ok(m) = rx.try_recv() {
+                incoming.push(m);
+            }
+        }
+        for m in incoming {
+            if m.from == "room" {
+                self.push_system_message(&format!("🔗 {}", m.text));
+            } else {
+                self.push_system_message(&format!("💬 {}: {}", m.from, m.text));
+            }
+        }
+    }
+
     fn filter_cuss(&self, text: String) -> String {
         if !self.settings.cuss_filter {
             return text;
@@ -2517,6 +3531,22 @@ impl App {
         self.alerts.iter().cloned().collect()
     }
 
+    /// The newest alert if it's only a few seconds old — shown as a transient top-left toast.
+    /// It still lives in `/alerts` afterwards.
+    pub fn toast(&self) -> Option<(AlertKind, String)> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let a = self.alerts.front()?;
+        let at: u64 = a.at.parse().unwrap_or(0);
+        if now.saturating_sub(at) <= 4 {
+            Some((a.kind.clone(), a.title.clone()))
+        } else {
+            None
+        }
+    }
+
     pub fn live_tasks(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.busy {
@@ -2524,6 +3554,13 @@ impl App {
         }
         if let Some(cmd) = self.pending_command.as_ref() {
             out.push(format!("Waiting command approval: {cmd}"));
+        }
+        if self.command_rx.is_some() {
+            out.push("Running a command…".to_string());
+        }
+        if let Some(q) = self.queued_prompt.as_ref() {
+            let preview: String = q.chars().take(40).collect();
+            out.push(format!("📨 Queued (↑ to edit): {preview}"));
         }
         if self.pending_trust_prompt {
             out.push("Waiting folder trust yes/no".to_string());
@@ -3010,6 +4047,7 @@ pub fn run_autonomous_coding(
 
     let mut written_files: Vec<String> = Vec::new();
     let mut skipped_files: Vec<String> = Vec::new();
+    let mut diffs: Vec<String> = Vec::new();
     let mut command_plan = Vec::new();
     if let Some(files) = plan.files {
         for f in files {
@@ -3017,7 +4055,9 @@ pub fn run_autonomous_coding(
                 if let Some(parent) = full.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::write(&full, f.content)?;
+                let old = fs::read_to_string(&full).unwrap_or_default();
+                diffs.push(render_diff(&f.path, &old, &f.content));
+                fs::write(&full, &f.content)?;
                 let rel = full
                     .strip_prefix(cwd)
                     .map(|p| p.display().to_string())
@@ -3047,6 +4087,9 @@ pub fn run_autonomous_coding(
             .collect::<Vec<_>>()
             .join("\n");
         sections.push(format!("📁 Files created/updated:\n{listed}"));
+        if !diffs.is_empty() {
+            sections.push(diffs.join("\n"));
+        }
     } else {
         sections.push("📁 No files were created.".to_string());
     }
@@ -3066,6 +4109,153 @@ pub fn run_autonomous_coding(
         text: sections.join("\n\n"),
         commands: command_plan,
     })
+}
+
+/// Read the on-screen text inside a selection region from the rendered terminal buffer.
+fn extract_selection_text(
+    buf: &ratatui::buffer::Buffer,
+    rect: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> String {
+    let right = rect.x + rect.width.saturating_sub(1);
+    let mut lines = Vec::new();
+    for y in start.1..=end.1 {
+        let x0 = if y == start.1 { start.0 } else { rect.x };
+        let x1 = if y == end.1 { end.0 } else { right };
+        let mut s = String::new();
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell(Position::new(x, y)) {
+                s.push_str(cell.symbol());
+            }
+        }
+        lines.push(s.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// Pull every `<OPENCAGE_CMD>…</OPENCAGE_CMD>` command out of a chat reply.
+pub fn extract_commands(raw: &str) -> Vec<String> {
+    let mut cmds = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<OPENCAGE_CMD>") {
+        let after = &rest[start + "<OPENCAGE_CMD>".len()..];
+        if let Some(end) = after.find("</OPENCAGE_CMD>") {
+            let cmd = after[..end].trim().to_string();
+            if !cmd.is_empty() {
+                cmds.push(cmd);
+            }
+            rest = &after[end + "</OPENCAGE_CMD>".len()..];
+        } else {
+            break;
+        }
+    }
+    cmds
+}
+
+/// The caretaker: a supervisor pass that checks an answer for hallucinations. Returns a short
+/// correction when it spots a problem, or `None` if the answer looks sound.
+fn caretaker_review(settings: &Settings, user_prompt: &str, answer: &str) -> Option<String> {
+    let prompt = format!(
+        "You are the Caretaker — a supervisor that double-checks another agent's answer for \
+         hallucinations (invented facts, made-up file contents, fabricated command output, or wrong \
+         claims). The user asked:\n{user_prompt}\n\nThe agent answered:\n{answer}\n\nIf the answer is \
+         accurate and invents nothing, reply with exactly: OK\nOtherwise, in 1-3 sentences, name the \
+         hallucination/error and give the correct information."
+    );
+    let raw = query_with_subagent(
+        settings, &[], &prompt, false, false, false, 2, false, SubAgent::Reviewer, &[], None,
+    )
+    .ok()?;
+    let body = raw
+        .trim()
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        .map(|(_, rest)| rest.trim().to_string())
+        .unwrap_or_else(|| raw.trim().to_string());
+    let norm = body.trim_end_matches('.').trim();
+    if body.is_empty() || norm.eq_ignore_ascii_case("OK") {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+/// True if a reply is effectively empty — nothing after an optional `[avatar]` tag.
+fn reply_is_blank(s: &str) -> bool {
+    let t = s.trim();
+    let body = t
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(t);
+    body.is_empty()
+}
+
+/// Remove command blocks from a chat reply so the raw tags aren't shown to the user.
+pub fn strip_cmd_blocks(raw: &str) -> String {
+    let mut out = String::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("<OPENCAGE_CMD>") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        if let Some(end) = after.find("</OPENCAGE_CMD>") {
+            rest = &after[end + "</OPENCAGE_CMD>".len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// A compact +/- diff of a file edit (prefix/suffix based — good for localized edits), so the
+/// user sees the code being changed, like a coding assistant's inline diff.
+fn render_diff(path: &str, old: &str, new: &str) -> String {
+    const MAX: usize = 40;
+    if old.is_empty() {
+        let mut s = format!("✏️ {path} (new file)\n");
+        for line in new.lines().take(MAX) {
+            s.push_str(&format!("+ {line}\n"));
+        }
+        if new.lines().count() > MAX {
+            s.push_str("  …\n");
+        }
+        return s;
+    }
+    let o: Vec<&str> = old.lines().collect();
+    let n: Vec<&str> = new.lines().collect();
+    let mut p = 0;
+    while p < o.len() && p < n.len() && o[p] == n[p] {
+        p += 1;
+    }
+    let mut suf = 0;
+    while suf < o.len().saturating_sub(p)
+        && suf < n.len().saturating_sub(p)
+        && o[o.len() - 1 - suf] == n[n.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    let removed = &o[p..o.len() - suf];
+    let added = &n[p..n.len() - suf];
+    if removed.is_empty() && added.is_empty() {
+        return format!("✏️ {path} (no changes)\n");
+    }
+    let mut s = format!("✏️ {path}\n");
+    if p > 0 {
+        s.push_str(&format!("  {}\n", o[p - 1]));
+    }
+    for line in removed.iter().take(MAX) {
+        s.push_str(&format!("- {line}\n"));
+    }
+    for line in added.iter().take(MAX) {
+        s.push_str(&format!("+ {line}\n"));
+    }
+    if removed.len() > MAX || added.len() > MAX {
+        s.push_str("  …\n");
+    }
+    s
 }
 
 fn safe_join_under(root: &Path, rel: &str) -> Option<PathBuf> {

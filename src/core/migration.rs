@@ -112,6 +112,14 @@ fn migrate_claude_code() -> Result<MigrationOutcome> {
     Ok(MigrationOutcome { oauth, sessions })
 }
 
+/// All Claude Code conversations currently on disk — used for the background 24/7 session sync.
+pub fn claude_sessions() -> Vec<ImportedSession> {
+    match claude_dir() {
+        Ok(base) => read_claude_history(&base.join("projects")),
+        Err(_) => Vec::new(),
+    }
+}
+
 fn read_claude_oauth(path: &Path) -> Result<OAuthCreds> {
     let text =
         fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;

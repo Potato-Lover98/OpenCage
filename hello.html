@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Red Circle Clicker</title>
+<style>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: system-ui, sans-serif;
+    background: #1e1e2f;
+    color: #fff;
+    user-select: none;
+  }
+  h1 { margin: 20px 0 10px; }
+  #hud {
+    display: flex;
+    gap: 30px;
+    font-size: 1.2rem;
+    margin-bottom: 10px;
+  }
+  #arena {
+    position: relative;
+    width: 90vw;
+    max-width: 700px;
+    height: 70vh;
+    background: #2a2a4a;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+  }
+  .circle {
+    position: absolute;
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 35%, #ff6b6b, #b00020);
+    cursor: pointer;
+    box-shadow: 0 4px 10px rgba(0,0,0,0.4);
+    transition: transform 0.08s;
+  }
+  .circle:active { transform: scale(0.85); }
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    background: rgba(0,0,0,0.6);
+    font-size: 1.5rem;
+    gap: 15px;
+  }
+  button {
+    padding: 10px 20px;
+    font-size: 1rem;
+    border: none;
+    border-radius: 8px;
+    background: #ff6b6b;
+    color: white;
+    cursor: pointer;
+  }
+  button:hover { background: #ff8585; }
+</style>
+</head>
+<body>
+  <h1>🎯 Red Circle Clicker</h1>
+  <div id="hud">
+    <div>Score: <span id="score">0</span></div>
+    <div>Time: <span id="time">20</span>s</div>
+    <div>Best: <span id="best">0</span></div>
+  </div>
+  <div id="arena">
+    <div id="overlay">
+      <div id="msg">Click the red circles as fast as you can!</div>
+      <button id="startBtn">Start Game</button>
+    </div>
+  </div>
+
+<script>
+  const arena = document.getElementById('arena');
+  const scoreEl = document.getElementById('score');
+  const timeEl = document.getElementById('time');
+  const bestEl = document.getElementById('best');
+  const overlay = document.getElementById('overlay');
+  const msg = document.getElementById('msg');
+  const startBtn = document.getElementById('startBtn');
+
+  let score = 0, timeLeft = 20, timerId, spawnId, playing = false;
+  let best = +localStorage.getItem('rcc_best') || 0;
+  bestEl.textContent = best;
+
+  function spawnCircle() {
+    const c = document.createElement('div');
+    c.className = 'circle';
+    const size = 30 + Math.random() * 40;
+    c.style.width = c.style.height = size + 'px';
+    const maxX = arena.clientWidth - size;
+    const maxY = arena.clientHeight - size;
+    c.style.left = Math.random() * maxX + 'px';
+    c.style.top = Math.random() * maxY + 'px';
+    c.addEventListener('pointerdown', e => {
+      e.stopPropagation();
+      if (!playing) return;
+      score++;
+      scoreEl.textContent = score;
+      c.remove();
+    });
+    arena.appendChild(c);
+    setTimeout(() => c.remove(), 1500);
+  }
+
+  function startGame() {
+    score = 0;
+    timeLeft = 20;
+    scoreEl.textContent = 0;
+    timeEl.textContent = timeLeft;
+    overlay.style.display = 'none';
+    document.querySelectorAll('.circle').forEach(c => c.remove());
+    playing = true;
+    spawnId = setInterval(spawnCircle, 700);
+    timerId = setInterval(() => {
+      timeLeft--;
+      timeEl.textContent = timeLeft;
+      if (timeLeft <= 0) endGame();
+    }, 1000);
+  }
+
+  function endGame() {
+    playing = false;
+    clearInterval(spawnId);
+    clearInterval(timerId);
+    document.querySelectorAll('.circle').forEach(c => c.remove());
+    if (score > best) {
+      best = score;
+      localStorage.setItem('rcc_best', best);
+      bestEl.textContent = best;
+      msg.textContent = `🏆 New best! Score: ${score}`;
+    } else {
+      msg.textContent = `Game over! Score: ${score}`;
+    }
+    startBtn.textContent = 'Play Again';
+    overlay.style.display = 'flex';
+  }
+
+  startBtn.addEventListener('click', startGame);
+</script>
+</body>
+</html>

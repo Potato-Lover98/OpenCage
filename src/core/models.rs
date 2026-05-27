@@ -14,6 +14,8 @@ pub enum Provider {
     /// Zhipu 智谱 GLM via open.bigmodel.cn (OpenAI-compatible).
     GlmBigModel,
     GithubCopilot,
+    /// Google Gemini via generativelanguage.googleapis.com (API key).
+    Gemini,
 }
 
 impl Provider {
@@ -25,10 +27,11 @@ impl Provider {
             Provider::MoonshotAi => "Moonshot AI",
             Provider::GlmBigModel => "GLM (BigModel)",
             Provider::GithubCopilot => "GitHub Copilot",
+            Provider::Gemini => "Gemini",
         }
     }
 
-    pub fn all() -> [Provider; 6] {
+    pub fn all() -> [Provider; 7] {
         [
             Provider::Groq,
             Provider::OpenAi,
@@ -36,6 +39,7 @@ impl Provider {
             Provider::MoonshotAi,
             Provider::GlmBigModel,
             Provider::GithubCopilot,
+            Provider::Gemini,
         ]
     }
 
@@ -60,6 +64,7 @@ impl Provider {
             Provider::MoonshotAi => &["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
             Provider::GlmBigModel => &["glm-4-flash", "glm-4", "glm-4-air", "glm-4-plus"],
             Provider::GithubCopilot => &["gpt-4o-mini", "claude-3.5-sonnet", "o3-mini"],
+            Provider::Gemini => &["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"],
         }
     }
 }
@@ -77,6 +82,9 @@ pub struct Settings {
     #[serde(default)]
     pub glm_api_key: Option<String>,
     pub github_copilot_token: Option<String>,
+    /// Google Gemini API key (set in /settings).
+    #[serde(default)]
+    pub gemini_api_key: Option<String>,
     /// OAuth access token migrated from Claude Code (`/migration`). Stored separately from
     /// `anthropic_api_key`; the existing API-key request path is left untouched.
     #[serde(default)]
@@ -112,6 +120,7 @@ impl Default for Settings {
             moonshot_api_key: None,
             glm_api_key: None,
             github_copilot_token: None,
+            gemini_api_key: None,
             anthropic_oauth_token: None,
             anthropic_oauth_expires_at: None,
             plugins: Vec::new(),

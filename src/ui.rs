@@ -99,17 +99,31 @@ fn append_message_as_chat_lines(all_lines: &mut Vec<Line>, m: &Message) {
         m.content.split('\n').collect()
     };
     for (i, part) in parts.iter().enumerate() {
+        // Color diff lines (+ green / - red, ✏️ header) so edits read like a real diff.
+        let content_span = match diff_line_style(part) {
+            Some(st) => Span::styled((*part).to_string(), st),
+            None => Span::raw((*part).to_string()),
+        };
         if i == 0 {
             all_lines.push(Line::from(vec![
                 Span::styled(format!("{emoji} "), head),
-                Span::raw((*part).to_string()),
+                content_span,
             ]));
         } else {
-            all_lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::raw((*part).to_string()),
-            ]));
+            all_lines.push(Line::from(vec![Span::raw("    "), content_span]));
         }
+    }
+}
+
+fn diff_line_style(part: &str) -> Option<Style> {
+    if part.starts_with("+ ") {
+        Some(Style::default().fg(Color::Green))
+    } else if part.starts_with("- ") {
+        Some(Style::default().fg(Color::Red))
+    } else if part.starts_with("✏️") {
+        Some(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    } else {
+        None
     }
 }
 
@@ -198,6 +212,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
     for m in &app.messages {
         append_message_as_chat_lines(&mut all_lines, m);
+    }
+    if app.busy {
+        all_lines.push(Line::from(""));
+        all_lines.push(Line::styled(
+            "🤔 thinking…",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+        ));
     }
     let chat_area = layout.chat;
     if let (Some(bar_area), Some((cmd, yes_selected))) =
@@ -303,15 +324,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let used = app.context_usage_chars();
     let limit = app.context_window_limit_chars.max(1);
     let pct = (used.saturating_mul(100) / limit).min(999);
+    // Small pie-style fill indicator for context usage.
+    let pie = match pct {
+        0..=12 => '○',
+        13..=37 => '◔',
+        38..=62 => '◑',
+        63..=87 => '◕',
+        _ => '●',
+    };
     let slider_text = format!(
         "Status: {status}\n[{filled}{empty}] {deep}/10\nCode mode: {coding_mode} (Ctrl+O)\n⚠ Higher levels use more tokens"
     );
     let deep_box = Paragraph::new(slider_text).block(
         Block::default()
-            .title(format!("🧠 Deep Think | Context {used}/{limit} ({pct}%)"))
+            .title(format!("{pie} 🧠 Deep Think | Context {used}/{limit} ({pct}%)"))
             .borders(Borders::ALL),
     );
     frame.render_widget(deep_box, footer[1]);
+
+    // Highlight the active text selection (drawn over the panel content, under any popups).
+    if let Some((rect, start, end)) = app.selection_region() {
+        highlight_selection(frame.buffer_mut(), rect, start, end);
+    }
 
     if let Some(popup) = app.pending_popup_text() {
         let area = centered_rect(52, 26, frame.area());
@@ -376,6 +410,49 @@ pub fn draw(frame: &mut Frame, app: &App) {
         frame.render_widget(list, area);
     }
 
+    // Transient toast (top-left) for the newest alert; it ages out on its own and stays in /alerts.
+    if let Some((kind, title)) = app.toast() {
+        let area = frame.area();
+        let w = 36.min(area.width.saturating_sub(2)).max(10);
+        let toast = Rect::new(1, 0, w, 3);
+        let color = match kind {
+            AlertKind::Success => Color::Green,
+            AlertKind::Error => Color::Red,
+            AlertKind::Warning => Color::Yellow,
+            AlertKind::Info => Color::Cyan,
+        };
+        frame.render_widget(Clear, toast);
+        let body = Paragraph::new(Line::styled(
+            title,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title("🔔"),
+        );
+        frame.render_widget(body, toast);
+    }
+}
+
+/// Reverse-video the cells inside a selection region (linear, panel-clipped).
+fn highlight_selection(
+    buf: &mut ratatui::buffer::Buffer,
+    rect: Rect,
+    start: (u16, u16),
+    end: (u16, u16),
+) {
+    let right = rect.x + rect.width.saturating_sub(1);
+    for y in start.1..=end.1 {
+        let x0 = if y == start.1 { start.0 } else { rect.x };
+        let x1 = if y == end.1 { end.0 } else { right };
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x, y)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
 }
 
 fn draw_alerts(frame: &mut Frame, app: &App) {
@@ -508,6 +585,7 @@ fn draw_settings(frame: &mut Frame, app: &App) {
         format!("Moonshot AI key: {}", mask_key(&form.moonshot)),
         format!("GLM (BigModel) key: {}", mask_key(&form.glm)),
         format!("Copilot token: {}", mask_key(&form.copilot)),
+        format!("Gemini (Google AI) key: {}", mask_key(&form.gemini)),
         format!(
             "Migrate history from: {} (←/→ · Enter to run)",
             crate::core::migration::MigrationSource::all()[form.migration_idx].label()

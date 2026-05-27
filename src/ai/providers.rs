@@ -39,6 +39,7 @@ pub fn validate_settings_keys(settings: &Settings) -> Vec<String> {
             settings.github_copilot_token.as_deref(),
             &["ghu_", "github_pat_", "ghp_"],
         ),
+        validate_one("Gemini", settings.gemini_api_key.as_deref(), &["AIza"]),
     ]
 }
 
@@ -183,7 +184,22 @@ pub fn query_with_subagent(
     } else {
         ""
     };
-    let system_prompt = format!("{base_prompt} {depth_hint} {coding_hint}");
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let system_prompt = format!(
+        "{base_prompt} {depth_hint} {coding_hint} \
+         You are running on the user's computer (OS: {os}). The current working directory is: {cwd}. \
+         When asked about the working directory, paths, or files, use this real path — never invent \
+         one like /home/user/Documents. \
+         IMPORTANT: you cannot run anything by yourself and you do NOT see shell output unless it is \
+         shown to you. NEVER claim you ran a command, or created/deleted/moved a file — that is a \
+         lie. To actually perform a shell action, emit the exact command(s) inside \
+         <OPENCAGE_CMD>command</OPENCAGE_CMD> tags and OpenCage will really run them (the user \
+         approves each one unless control mode is on; blacklisted commands are refused). Only after \
+         you see real output may you describe results.",
+        os = std::env::consts::OS,
+    );
     let rag_text = if rag_context.is_empty() {
         String::new()
     } else {
@@ -260,6 +276,9 @@ fn call_with_fallback(
             Provider::MoonshotAi => call_moonshot(client, settings, &assignment.model, messages),
             Provider::GlmBigModel => call_glm_bigmodel(client, settings, &assignment.model, messages),
             Provider::GithubCopilot => call_copilot(client, settings, &assignment.model, messages),
+            Provider::Gemini => {
+                call_gemini(client, settings, &assignment.model, history, system_prompt)
+            }
         };
         match result {
             Ok(text) if !response_is_error(&text) => return text,
@@ -316,7 +335,10 @@ For terminal commands use:
 Rules: write COMPLETE file contents (never elide with comments like \"// rest unchanged\"); \
 do NOT wrap the blocks in markdown code fences; output only plain UTF-8 text; \
 keep any summary to one short sentence placed AFTER all blocks. \
-You may include multiple file/cmd blocks. {depth_hint} {detail_hint}"
+You may include multiple file/cmd blocks. {depth_hint} {detail_hint} \
+The project working directory is {cwd} (OS: {os}); write file paths relative to it, and never invent paths.",
+        cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string()),
+        os = std::env::consts::OS,
     );
     let mut messages = vec![json!({"role":"system","content":system_prompt})];
     for m in recent_within_budget(history, CONTEXT_BUDGET_CHARS) {
@@ -335,6 +357,7 @@ You may include multiple file/cmd blocks. {depth_hint} {detail_hint}"
         Provider::MoonshotAi => call_moonshot(&client, settings, &assignment.model, &messages),
         Provider::GlmBigModel => call_glm_bigmodel(&client, settings, &assignment.model, &messages),
         Provider::GithubCopilot => call_copilot(&client, settings, &assignment.model, &messages),
+        Provider::Gemini => call_gemini(&client, settings, &assignment.model, history, &system_prompt),
     }
 }
 
@@ -463,6 +486,12 @@ pub fn provider_has_credentials(settings: &Settings, provider: &Provider) -> boo
             .as_ref()
             .is_some_and(|v| !v.trim().is_empty())
             || std::env::var("GITHUB_COPILOT_TOKEN").ok().is_some(),
+        Provider::Gemini => settings
+            .gemini_api_key
+            .as_ref()
+            .is_some_and(|v| !v.trim().is_empty())
+            || std::env::var("GEMINI_API_KEY").ok().is_some()
+            || std::env::var("GOOGLE_API_KEY").ok().is_some(),
     }
 }
 
@@ -764,6 +793,61 @@ fn call_copilot(
         .json()
         .context("GitHub Copilot returned invalid JSON")?;
     extract_openai_like_content("GitHub Copilot", &v)
+}
+
+fn call_gemini(
+    client: &Client,
+    settings: &Settings,
+    model: &str,
+    history: &[Message],
+    system_prompt: &str,
+) -> Result<String> {
+    let key = settings
+        .gemini_api_key
+        .clone()
+        .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+        .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
+        .context("Gemini API key missing (set it in /settings)")?;
+    // Gemini wants alternating user/model turns under `contents`; system text goes separately.
+    let contents: Vec<_> = history
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .map(|m| {
+            json!({
+                "role": if m.role == "assistant" { "model" } else { "user" },
+                "parts": [{"text": m.content}]
+            })
+        })
+        .collect();
+    let body = json!({
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": 8192}
+    });
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    );
+    let resp = client.post(&url).json(&body).send().context("Gemini request failed")?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().context("Gemini returned invalid JSON")?;
+    if !status.is_success() {
+        let err = v["error"]["message"].as_str().unwrap_or("Unknown Gemini error");
+        return Ok(format!("Gemini API error ({status}): {err}"));
+    }
+    let text: String = v["candidates"][0]["content"]["parts"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Ok("Gemini returned no content. Check the model name and API key.".to_string());
+    }
+    Ok(text)
 }
 
 fn extract_openai_like_content(provider: &str, v: &serde_json::Value) -> Result<String> {
